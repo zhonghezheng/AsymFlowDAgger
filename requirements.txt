@@ -5,7 +5,7 @@ peft==0.17.0
 sentencepiece
 accelerate
 tensorboard
-setuptools<74
+setuptools<81  # pkg_resources removed in 81; mmcv 1.6.1's setup.py needs it
 bitsandbytes>=0.46.1
 yapf==0.40.1
 zstandard
