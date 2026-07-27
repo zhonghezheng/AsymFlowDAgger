@@ -16,8 +16,12 @@ class GaussianFlowDagger(GaussianFlow):
     low-rank parametrisation (``proj_buffer`` / calibration). On-path minibatches
     run the unchanged GaussianFlow loss (:meth:`GaussianFlow.forward_train`); when
     a ``buffer_batch`` of expert-labelled rollout states is supplied, a velocity
-    term toward the empirical-expert target is added through the *same*
-    ``flow_loss`` module (so scaling and logging match on-path exactly).
+    term toward the empirical-expert target (through the *same* ``flow_loss``
+    module) is mixed in as a CONVEX combination
+    ``loss = (1 - w) * mean_onpath + w * mean_rollout``. ``roll_weight='proportional'``
+    sets ``w = n_roll / bs`` -- the rollout point fraction from the t_split carve --
+    so the combined loss is a single per-point mean over the whole batch and the
+    sigma marginal matches the base schedule; a float uses a fixed convex weight.
 
     Expert target ``L`` (``complement_mode='project'``, the derived asym loss):
 
@@ -30,12 +34,14 @@ class GaussianFlowDagger(GaussianFlow):
     ``u_t`` on-path when ``x0_hat = x_0`` -- ``'full'`` exactly, ``'project'`` in
     the subspace.
 
-    The DAGGER stream is class-*conditional*: rollout states are generated for
-    sampled classes (with inference CFG) and labelled by a class-restricted
-    empirical expert; the buffer ``pred`` conditions on those same classes. The
-    on-path loss is class-conditional as usual. ``'project'`` mode requires an
-    ``AsymJiT``-style denoising network exposing ``proj_buffer`` / ``pack`` /
-    ``patchify``.
+    The DAGGER stream is *unguided* (no CFG): rollout states are generated either
+    class-conditionally (their sampled class) or unconditionally (the CFG-dropout
+    rows) and labelled by a matching empirical expert (class-restricted bank for
+    conditional rows, whole-pool posterior for null rows); the buffer ``pred``
+    conditions on those same (dropout-applied) labels, so each state is on-policy
+    for the field trained on it. The on-path loss is class-conditional as usual.
+    ``'project'`` mode requires an ``AsymJiT``-style denoising network exposing
+    ``proj_buffer`` / ``pack`` / ``patchify``.
 
     ``onpath_expert_vel=True`` additionally relabels the *on-path* targets with
     the empirical expert's posterior-mean velocity (same ``expert_target`` /
@@ -49,7 +55,7 @@ class GaussianFlowDagger(GaussianFlow):
     def __init__(self,
                  *args,
                  complement_mode='project',
-                 roll_weight=1.0,
+                 roll_weight='proportional',
                  t_split=None,
                  onpath_expert_vel=False,
                  **kwargs):
@@ -60,6 +66,12 @@ class GaussianFlowDagger(GaussianFlow):
         if complement_mode == 'project':
             assert hasattr(self.denoising, 'proj_buffer'), \
                 "complement_mode='project' needs an AsymJiT-style denoising with proj_buffer."
+        # convex mix weight for the rollout stream: 'proportional' -> w = n_roll/bs
+        # (matches the t_split carve, so on-path + rollout form one per-point mean);
+        # or a fixed float convex weight in [0, 1].
+        assert roll_weight == 'proportional' or (
+            isinstance(roll_weight, (int, float)) and 0.0 <= roll_weight <= 1.0), \
+            "roll_weight must be 'proportional' or a float convex weight in [0, 1]."
         self.complement_mode = complement_mode
         self.roll_weight = roll_weight
         # timestep split: on-path FM covers sigma < t_split (data side), the DAGGER
@@ -205,7 +217,7 @@ class GaussianFlowDagger(GaussianFlow):
                 running_status=running_status,
                 **kwargs)
 
-        if buffer_batch is not None and self.roll_weight > 0:
+        if buffer_batch is not None and self.roll_weight != 0:
             x_t = buffer_batch['x_t']
             sigma = buffer_batch['sigma'].reshape(-1)   # [Bb]
             x0_hat = buffer_batch['x0_hat']
@@ -218,7 +230,18 @@ class GaussianFlowDagger(GaussianFlow):
             u_t_pred = denoising_output * clamp_coef                 # denoising_mean_mode == 'U'
             u_t = self.expert_target(x_t, sigma, x0_hat)
             roll_loss = self.flow_loss(dict(u_t_pred=u_t_pred, u_t=u_t, timesteps=t))
-            loss = loss + self.roll_weight * roll_loss
+
+            # convex combination weighted by the rollout point fraction. With the
+            # t_split carve the on-path stream holds n_on = x_0.size(0) points and
+            # the rollout holds n_roll = x_t.size(0) (n_on + n_roll = bs), so
+            # 'proportional' (w = n_roll/bs) makes loss a single per-point mean over
+            # the whole batch; a float uses a fixed convex weight instead.
+            n_roll = x_t.size(0)
+            n_on = x_0.size(0)
+            w = n_roll / (n_on + n_roll) if self.roll_weight == 'proportional' \
+                else float(self.roll_weight)
+            loss = (1.0 - w) * loss + w * roll_loss
             log_vars['loss_dagger'] = roll_loss.detach()
+            log_vars['roll_weight'] = roll_loss.new_tensor(w)
 
         return loss, log_vars

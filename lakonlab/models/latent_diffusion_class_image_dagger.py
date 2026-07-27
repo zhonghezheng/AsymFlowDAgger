@@ -42,13 +42,7 @@ class LatentDiffusionClassImageDagger(LatentDiffusionClassImage):
         bs, diffusion_args, diffusion_kwargs = super()._prepare_train_minibatch_args(
             data, running_status)
 
-        # grow the expert reservoir from this batch's real data latents + labels
-        # (rgetattr unwraps the DDP layer that wraps self.diffusion; use the true
-        # data labels, not the CFG-dropout labels in diffusion_kwargs)
-        if self.expert is not None:
-            self.expert.push_pool(
-                diffusion_args[0].detach(), rgetattr(self.diffusion, 'feat_fn'),
-                data['labels'])
+        # (the expert's banks come from disk on demand -- no reservoir to grow here.)
 
         # no buffer yet (before the first rollout round): pure full-range on-path.
         if not self.dagger_buffer:

@@ -1,6 +1,8 @@
 from .ema_hook import ExponentialMovingAverageHook
 from .checkpoint import CheckpointHook
 from .dagger_hook import DaggerRolloutHook
+from .wandb_rollout_hook import WandbTrajectoryHook
 from .logger import *
 
-__all__ = ['CheckpointHook', 'ExponentialMovingAverageHook', 'DaggerRolloutHook']
+__all__ = ['CheckpointHook', 'ExponentialMovingAverageHook', 'DaggerRolloutHook',
+           'WandbTrajectoryHook']

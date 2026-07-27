@@ -3,34 +3,45 @@ name = 'asymflow_h_16_r8_imagenet_dagger_4gpus'
 
 # --- finetuning schedule (from the released checkpoint) ---
 steps_per_epoch = 2502  # 1.28M / (4 gpus * 128)
-total_iters = 20000
+# short comparison run: 10 DAGGER rounds (round_interval=500 -> 10 * 500 = 5000 iters),
+# enough to get signal on dagger vs regular finetuning.
+total_iters = 5000
 warmup_iters = 200
-save_interval = 2000
-must_save_interval = 10000
-eval_interval = 5000
+save_interval = 2500
+must_save_interval = 5000
+eval_interval = 500     # eval (10k FID) + trajectory viz every 500 iters (10 evals over 5000)
 
 # --- DAGGER knobs ---
 latent_size = (3, 256, 256)
-round_interval = 500     # iters between rollout rounds
-n_rollout = 128          # trajectories rolled out per round
-rollout_nfe = 20         # Euler steps captured per rollout (buffer ~= n_rollout * nfe points)
+round_interval = 500     # iters between rollout rounds (10 rounds over 5000 iters)
+n_rollout = 1024         # trajectories/round per rank (~2.9x buffer reuse; fits 600G at K=128)
+rollout_nfe = 50         # Heun steps per rollout, matching the eval sampler (FlowHeunODE, 50)
 # timestep split: on-path FM covers sigma < t_split (data side), DAGGER rollout/
 # expert covers sigma >= t_split (noise side). Each train minibatch is carved to a
 # fixed batch_size, split by the base logit-normal mass p_high = P(sigma >= t_split):
 # n_on = round(bs*(1-p_high)) on-path points, n_roll = bs - n_on rollout points.
-t_split = 0.8
+# 0.88 aligns the expert coverage (sigma >= 0.88) with the eval CFG interval's
+# no-guidance tail (guidance_interval=[0,0.88] -> CFG off for sigma > 0.88), so
+# DAGGER corrects exactly the high-noise region that inference leaves unguided.
+t_split = 0.88
 complement_mode = 'project'  # 'project' (derived asym loss) | 'full' (keep complement noise)
 
 model = dict(
     type='LatentDiffusionClassImageDagger',
     expert=dict(
         type='EmpiricalExpert',
-        # per-class reservoir of real data latents (CPU): num_classes * per_class_pool
-        # latents total. At 3x256x256, 1000*64 ~= 50 GB/rank (x4 ranks in RAM).
+        # bank drawn fresh from the FULL dataset on disk (no RAM reservoir): loads
+        # bank_size real images per class per rollout chunk, encoded with the exact
+        # train pipeline. Amortized disk IO instead of a ~TB RAM reservoir, and the
+        # bank covers the whole class rather than a sliding window.
+        datalist_path='data/imagenet/train.txt',
+        data_root='data/imagenet/train/',
+        image_size=256,
         num_classes=1000,
-        per_class_pool=64,   # guaranteed members per class (on-path uses all of them)
-        bank_k=1024,         # sampled bank per rollout trajectory; cap for null on-path
-        sample_chunk=32,     # rows per chunk
+        bank_size=None,      # None -> ENTIRE class per bank (all its images, <=1300)
+        null_bank_size=512,  # unconditional bank cap (never load the whole dataset)
+        num_workers=32,      # parallel image load/decode threads
+        sample_chunk=32,     # rows per chunk in x0_hat
         bank_chunk=128,      # bank entries summed at once (peak ~ chunk*bank_chunk latents)
     ),
     vae=dict(
@@ -39,18 +50,26 @@ model = dict(
     diffusion=dict(
         type='GaussianFlowDagger',
         complement_mode=complement_mode,
-        roll_weight=1.0,
+        # convex loss mix: (1-w)*mean_onpath + w*mean_rollout. 'proportional' sets
+        # w = n_roll/bs (~0.07 at t_split=0.88), so on-path + rollout form a single
+        # per-point mean over the batch (was additive w/ roll_weight=1 -> rollout
+        # was ~13x over-weighted vs its point share).
+        roll_weight='proportional',
         t_split=t_split,
         # label on-path samples with the empirical expert velocity instead of the
         # true FM residual (noise - x_0). Set False to keep standard FM on-path.
-        onpath_expert_vel=True,
+        onpath_expert_vel=False,
         denoising=dict(
             type='AsymJiT',
             patch_size=16,
             in_channels=3,
             basis_rank=8,
             num_timesteps=1,
-            pretrained_linear_proj='checkpoints/asymflow_subspace_pca_dit.pth',
+            # finetune from the released checkpoint: the AsymJiT weights (incl.
+            # proj_buffer / scale_buffer) are loaded here via `pretrained`. This is
+            # mutually exclusive with `pretrained_linear_proj` (which is only for
+            # from-scratch training) -- the checkpoint already carries the subspace.
+            pretrained='models/asymflow_h_16_r8_imagenet.safetensors',
             input_size=256,
             hidden_size=1280,
             depth=32,
@@ -122,12 +141,15 @@ data = dict(
         negative_label=1000,
         latent_size=(3, 256, 256),
         test_label_sampling='equal',
+        num_test_images=10000,   # eval generates 10k images (== dataset length) for the FID
         test_mode=True),
     val_dataloader=dict(samples_per_gpu=64),
     test_dataloader=dict(samples_per_gpu=64),
     pin_memory=True,
     persistent_workers=True,
-    prefetch_factor=32,
+    # 32 was overkill (data_time ~0.004s) and buffered ~100 GB of decoded images
+    # across 4 ranks -> host OOM. 4 is plenty to keep the H200s fed.
+    prefetch_factor=4,
     multiprocessing_context='fork',
 )
 
@@ -171,8 +193,11 @@ evaluation = [
         metrics=[
             dict(
                 type='InceptionMetrics',
-                num_images=50000,
-                reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl',
+                num_images=10000,
+                reference_pkl='models/imagenet256_inception_adm.pkl',
+                inception_args=dict(
+                    type='StyleGAN',
+                    inception_path='models/inception-2015-12-05.pt'),
             ),
         ],
         save_best_ckpt=False,
@@ -184,6 +209,12 @@ log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
+        # training losses (loss_diffusion, loss_dagger) + eval metrics (FID, ...)
+        # flow through the log buffer to wandb automatically. OFFLINE: compute
+        # nodes can't reach api.wandb.ai -> `wandb sync` from the login node after.
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(project='asymflow-dagger', name=name, mode='offline')),
     ])
 
 custom_hooks = [
@@ -206,13 +237,32 @@ custom_hooks = [
         null_label=1000,
         # prob_class omitted -> inherits train_cfg.prob_class (0.9), so the
         # DAGGER CFG dropout stays inline with the on-path stream automatically.
-        # t_split omitted -> inherits diffusion.t_split (0.5); captures sigma >= t_split.
-        rollout_chunk=64,
-        guidance_scale=guidance_scale,        # inference CFG, so visited states match sampling
-        guidance_interval=guidance_interval,
+        # t_split omitted -> inherits diffusion.t_split (0.88); captures sigma >= t_split.
+        # smaller chunk -> fewer per-class banks held at once (all 4 ranks build
+        # banks simultaneously); keeps host RAM modest with entire-class banks.
+        rollout_chunk=16,
+        guidance_scale=1.0,   # unguided: conditional-no-CFG or unconditional (guarded in the hook)
+        label_time_dropout=True,         # always-conditional rollout; CFG dropout per captured point
+        class_sampling='proportional',   # rollout classes ~ dataset prior (like on-path)
+        sampler='FlowHeunODE',           # match the eval sampler so captured states are on-policy
         use_ema_rollout=False,
         aggregate_buffer=False,
         priority='NORMAL'),
+    # log a denoising-trajectory image grid to wandb alongside eval
+    dict(
+        type='WandbTrajectoryHook',
+        interval=eval_interval,
+        latent_size=latent_size,
+        nfe=16,          # lighter than the full eval sampler; enough for a nice trajectory
+        n_samples=4,
+        max_cols=8,      # subsample the trajectory to 8 columns
+        num_classes=1000,
+        null_label=1000,
+        guidance_scale=guidance_scale,
+        guidance_interval=guidance_interval,
+        use_ema=True,
+        sampler='FlowHeunODE',
+        priority='LOW'),
 ]
 
 runner = dict(
@@ -226,7 +276,9 @@ runner = dict(
     gc_interval=1000)
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-load_from = 'models/asymflow_h_16_r8_imagenet.safetensors'
+# weights come from denoising.pretrained (the released AsymJiT checkpoint has bare
+# denoising keys, so it must load there, not via top-level load_from).
+load_from = None
 resume_from = f'checkpoints/{name}/latest.pth'
 workflow = [('train', save_interval)]
 module_wrapper = 'ddp'

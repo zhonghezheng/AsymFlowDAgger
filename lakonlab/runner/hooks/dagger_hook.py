@@ -18,10 +18,13 @@ class DaggerRolloutHook(Hook):
     ``(x_t, sigma, x0_hat, label)`` in ``model.dagger_buffer``. The training step
     then mixes those in via ``LatentDiffusionClassImageDagger``.
 
-    Rollout is class-*conditional*: each trajectory draws a random class, is
-    integrated with the inference CFG (``guidance_scale`` / ``guidance_interval``,
-    matching eval so visited states match the true sampling distribution), and is
-    labelled by a class-restricted empirical bank (``sample_bank_idx(labels)``).
+    Rollout is *unguided* (no CFG) by design: each trajectory is generated either
+    class-conditionally (its sampled class, no guidance) or unconditionally (the
+    CFG-dropout rows, class ``null``), so every visited state stays on-policy for
+    the field that will be trained on it, and is labelled by a matching empirical
+    bank (``sample_bank_idx(train_labels)`` -- class-restricted for conditional
+    rows, whole-pool posterior for null rows). ``guidance_scale`` is guarded to
+    ``1.0``; CFG-guided rollouts would be off-policy for the labelled velocity.
     Under DDP each rank rolls out and labels independently (data-parallel). Runs
     in ``before_train_iter`` so the fresh buffer is available to the same
     iteration's train step.
@@ -47,8 +50,18 @@ class DaggerRolloutHook(Hook):
             t_split`` (the noise side; complementary to the on-path stream, which
             covers ``sigma < t_split``). ``None`` (default) inherits
             ``diffusion.t_split``; if that is also ``None``, every step is kept.
-        guidance_scale (float): CFG scale for rollout (1.0 = none).
-        guidance_interval (list | None): ``[lo, hi]`` sigma window for CFG.
+        guidance_scale (float): must be ``1.0`` -- rollouts are unguided by design
+            (class-conditional without CFG, or unconditional). Guarded in __init__.
+        label_time_dropout (bool): if True, roll out ALWAYS class-conditionally and
+            apply the CFG dropout per captured point at *label* time instead of per
+            trajectory before generation. Same expected conditional/null proportions
+            and targets as the default, but null points then draw states from the
+            conditional (class-marginal) distribution rather than the unconditional
+            one -- equivalent only where the two coincide (high sigma). Default False.
+        class_sampling (str): ``'uniform'`` (default) draws rollout classes
+            uniformly; ``'proportional'`` draws them from the empirical data class
+            prior (``expert.sample_labels``), matching the on-path stream's
+            (mildly imbalanced) class distribution.
         use_ema_rollout (bool): roll out with the EMA policy instead of online.
         aggregate_buffer (bool): accumulate rounds instead of rebuilding.
         sampler (str): scheduler name for rollout.
@@ -65,10 +78,11 @@ class DaggerRolloutHook(Hook):
                  rollout_chunk=128,
                  t_split=None,
                  guidance_scale=1.0,
-                 guidance_interval=None,
+                 label_time_dropout=False,
+                 class_sampling='uniform',
                  use_ema_rollout=False,
                  aggregate_buffer=False,
-                 sampler='FlowEulerODE'):
+                 sampler='FlowHeunODE'):
         self.round_interval = round_interval
         self.n_rollout = n_rollout
         self.nfe = nfe
@@ -78,8 +92,15 @@ class DaggerRolloutHook(Hook):
         self.prob_class = prob_class
         self.rollout_chunk = rollout_chunk
         self.t_split = t_split
+        assert guidance_scale == 1.0, (
+            'DaggerRolloutHook requires guidance_scale == 1.0: rollouts must be '
+            'unguided (class-conditional without CFG, or unconditional) so the '
+            'expert labels the states the trained field actually visits. A '
+            'CFG-guided rollout would be off-policy for the labelled velocity.')
         self.guidance_scale = guidance_scale
-        self.guidance_interval = guidance_interval
+        self.label_time_dropout = label_time_dropout
+        assert class_sampling in ('uniform', 'proportional')
+        self.class_sampling = class_sampling
         self.use_ema_rollout = use_ema_rollout
         self.aggregate_buffer = aggregate_buffer
         self.sampler = sampler
@@ -110,7 +131,6 @@ class DaggerRolloutHook(Hook):
             else diffusion
 
         device = next(diffusion.parameters()).device
-        use_cfg = self.guidance_scale is not None and self.guidance_scale > 1.0
         # keep dropout inline with the on-path stream: default to the model's
         # train_cfg.prob_class (same keep-vs-null mechanism, same probability).
         prob_class = self.prob_class if self.prob_class is not None \
@@ -119,6 +139,16 @@ class DaggerRolloutHook(Hook):
         # diffusion's t_split so it stays complementary to the on-path stream.
         t_split = self.t_split if self.t_split is not None \
             else getattr(diffusion, 't_split', None)
+
+        # expert banks are built from real images on disk, encoded with the exact
+        # train pipeline: patchify(vae.encode(img*2-1)) -> diffusion input space.
+        feat_fn = diffusion.feat_fn
+        vae = model.vae
+        vae_dtype = vae.dtype if hasattr(vae, 'dtype') else next(vae.parameters()).dtype
+
+        def encode_fn(imgs):
+            lat = vae.encode((imgs * 2 - 1).to(vae_dtype)).float()
+            return model.patchify(lat)
 
         if not self.aggregate_buffer:
             model.dagger_buffer = []
@@ -130,33 +160,37 @@ class DaggerRolloutHook(Hook):
             remaining -= b
 
             noise = model.patchify(torch.randn((b, c, h, w), device=device))
-            labels = torch.randint(0, self.num_classes, (b,), device=device)  # sampled classes
-
-            # CFG dropout for the DAGGER stream (analogue of on-path prob_class):
-            # some trajectories are trained as the null/unconditional class so the
-            # unconditional field -- which co-generates the CFG states -- also gets
-            # corrected. State generation still uses the true class; dropout only
-            # changes the training label + expert bank.
-            train_labels = labels
-            if prob_class < 1.0:
-                keep = torch.rand(b, device=device) < prob_class
-                train_labels = torch.where(
-                    keep, labels, torch.full_like(labels, self.null_label))
-
-            # null rows have no reservoir members -> sample_bank_idx falls back to
-            # the full pool, i.e. the *unconditional* posterior mean.
-            bank_idx = model.expert.sample_bank_idx(train_labels, device)  # pinned per trajectory
-
-            # class conditioning; under CFG forward_test expects [negative, positive]
-            if use_cfg:
-                null = torch.full((b,), self.null_label, dtype=torch.long, device=device)
-                class_labels = torch.cat([null, labels], dim=0)
+            if self.class_sampling == 'proportional':
+                # match the dataset's (mildly imbalanced) class prior, like the
+                # on-path stream, rather than sampling classes uniformly.
+                labels = model.expert.sample_labels(b, device)
             else:
+                labels = torch.randint(0, self.num_classes, (b,), device=device)  # uniform
+
+            if self.label_time_dropout:
+                # VARIANT: rollout is ALWAYS class-conditional; CFG dropout is applied
+                # per captured point at LABEL time (a fresh mask each step relabels
+                # points to null). NB: null points then come from the conditional
+                # (class-marginal) state distribution, not the unconditional one.
                 class_labels = labels
+                needed = set(labels.tolist()) | {self.null_label}
+            else:
+                # DEFAULT: trajectory-level CFG dropout applied BEFORE generation, so a
+                # dropped trajectory is GENERATED unconditionally and stays on-policy
+                # for the unconditional field. Generation / label / target all key on
+                # train_labels.
+                train_labels = labels
+                if prob_class < 1.0:
+                    keep = torch.rand(b, device=device) < prob_class
+                    train_labels = torch.where(
+                        keep, labels, torch.full_like(labels, self.null_label))
+                class_labels = train_labels
+                needed = set(train_labels.tolist())
+
+            # load the per-class disk banks this chunk needs (freed after the chunk).
+            banks = model.expert.build_banks(needed, encode_fn, feat_fn, device)
 
             test_cfg_override = dict(sampler=self.sampler, num_timesteps=self.nfe)
-            if use_cfg and self.guidance_interval is not None:
-                test_cfg_override['guidance_interval'] = self.guidance_interval
 
             captured = []
 
@@ -164,20 +198,31 @@ class DaggerRolloutHook(Hook):
                 sigma = float(kw['t']) / diffusion.num_timesteps
                 if t_split is None or sigma >= t_split:
                     x_t = kw['x_t']
+                    if self.label_time_dropout:
+                        # fresh per-point CFG-dropout mask at label time
+                        if prob_class < 1.0:
+                            keep = torch.rand(b, device=device) < prob_class
+                        else:
+                            keep = torch.ones(b, dtype=torch.bool, device=device)
+                        point_labels = torch.where(
+                            keep, labels, torch.full_like(labels, self.null_label))
+                    else:
+                        point_labels = train_labels
                     x0_hat = model.expert.x0_hat(
-                        x_t, sigma, diffusion.feat_fn, bank_idx=bank_idx)
+                        x_t, sigma, feat_fn, point_labels, banks)
                     captured.append((x_t.detach().cpu(), sigma,
-                                     x0_hat.detach().cpu(), train_labels.detach().cpu()))
+                                     x0_hat.detach().cpu(), point_labels.detach().cpu()))
                 return kw
 
             net.forward_test(
                 noise=noise,
-                guidance_scale=self.guidance_scale if use_cfg else 1.0,
+                guidance_scale=1.0,  # unguided (guarded in __init__)
                 test_cfg_override=test_cfg_override,
                 class_labels=class_labels,
                 sample_callback=sample_callback)
 
             model.dagger_buffer.extend(captured)
+            del banks
 
         if was_training:
             diffusion.train()
