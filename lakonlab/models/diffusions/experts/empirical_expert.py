@@ -63,6 +63,8 @@ class EmpiricalExpert(nn.Module):
                  num_classes=1000,
                  bank_size=256,
                  null_bank_size=512,
+                 random_flip=True,
+                 include_flips=False,
                  num_workers=32,
                  sample_chunk=32,
                  bank_chunk=128,
@@ -74,6 +76,8 @@ class EmpiricalExpert(nn.Module):
         self.num_classes = num_classes
         self.bank_size = bank_size
         self.null_bank_size = null_bank_size
+        self.random_flip = random_flip   # match the training augmentation (h-flip p=0.5)
+        self.include_flips = include_flips  # add BOTH h-orientations of every image to the bank
         self.num_workers = num_workers
         self.sample_chunk = sample_chunk
         self.bank_chunk = bank_chunk
@@ -125,7 +129,7 @@ class EmpiricalExpert(nn.Module):
         data_path = self.file_client.join_path(self.data_root, p)
         data_bytes = self.file_client.get(data_path)
         img = Image.open(BytesIO(data_bytes)).convert('RGB')
-        arr = image_preproc(img, self.image_size, random_flip=False)
+        arr = image_preproc(img, self.image_size, random_flip=self.random_flip)
         return torch.from_numpy(arr).float().permute(2, 0, 1) / 255.0
 
     def _load_images(self, paths, device):
@@ -151,33 +155,49 @@ class EmpiricalExpert(nn.Module):
         return [pool[i] for i in idx]
 
     @torch.no_grad()
-    def build_banks(self, class_ids, encode_fn, feat_fn, device):
-        """Load one bank per requested class -> ``{class_id: (latents_cpu, feats)}``.
-
-        ``encode_fn`` maps loaded images ``[B, 3, H, W] in [0,1]`` to the diffusion
-        input space (``patchify(vae.encode(img*2-1))``); ``feat_fn`` maps that to the
-        compact subspace. Latents are returned on CPU (streamed to device in
-        :meth:`x0_hat`); compact feats stay on ``device``.
-        """
-        banks = {}
-        for c in sorted(set(int(x) for x in class_ids)):
-            imgs = self._load_images(self._draw_paths(c), device)
-            latents = encode_fn(imgs)                 # [B, C, H, W] diffusion input space
-            feats = feat_fn(latents).flatten(1)       # [B, Df]
-            banks[c] = (latents.detach().cpu(), feats.detach())
-        return banks
+    def _build_one(self, paths, encode_fn, feat_fn, device):
+        """Load one bank from ``paths`` -> ``(latents_cpu bf16, feats)``. include_flips
+        adds both h-orientations (free, in-memory); bf16 halves the CPU latent RAM."""
+        imgs = self._load_images(paths, device)
+        if self.include_flips:
+            imgs = torch.cat([imgs, torch.flip(imgs, dims=[-1])], dim=0)
+        latents = encode_fn(imgs)                 # [M, C, H, W] diffusion input space
+        feats = feat_fn(latents).flatten(1)       # [M, Df]
+        # bf16 latents on CPU: half the RAM; x0_hat is a weighted average so the
+        # precision loss is negligible.
+        return (latents.detach().to(torch.bfloat16).cpu(), feats.detach())
 
     @torch.no_grad()
-    def x0_hat(self, x_t, sigma, feat_fn, labels, banks):
-        """Posterior-mean data estimate over each row's per-class bank.
+    def build_banks(self, labels, encode_fn, feat_fn, device):
+        """Build one INDEPENDENT bank PER TRAJECTORY. For each row ``i`` (sampled
+        class ``labels[i]``): a conditional bank (``bank_size`` draw from that class)
+        AND a null bank (``null_bank_size`` draw from the whole dataset). Returns
+        ``(cond_banks, null_banks)``, each a list of ``(latents_cpu, feats)`` indexed
+        by trajectory position -- no per-class or shared-null pooling, so different
+        trajectories (even of the same class) get different posteriors.
+
+        ``encode_fn`` maps loaded images ``[M, 3, H, W] in [0,1]`` to the diffusion
+        input space (``patchify(vae.encode(img*2-1))``); ``feat_fn`` -> compact subspace.
+        """
+        labels = labels.tolist() if torch.is_tensor(labels) else [int(x) for x in labels]
+        cond_banks, null_banks = [], []
+        for c in labels:
+            cond_banks.append(self._build_one(self._draw_paths(int(c)), encode_fn, feat_fn, device))
+            null_banks.append(self._build_one(self._draw_paths(-1), encode_fn, feat_fn, device))  # -1 -> null draw
+        return cond_banks, null_banks
+
+    @torch.no_grad()
+    def x0_hat(self, x_t, sigma, feat_fn, labels, cond_banks, null_banks, null_label):
+        """Posterior-mean data estimate, each row over its OWN trajectory bank:
+        row ``i`` uses ``cond_banks[i]`` if ``labels[i] != null_label`` else
+        ``null_banks[i]`` (both from :meth:`build_banks`, indexed by position).
 
         Args:
             x_t (Tensor): ``[B, C, H, W]`` visited states.
             sigma (float | Tensor): scalar or ``[B]`` noise levels in ``[0, 1]``.
             feat_fn (callable): ``[*, C, H, W] -> [*, Df]`` compact projection.
-            labels (Tensor): ``[B]`` class id per row (null id -> its bank).
-            banks (dict): ``{class_id: (latents_cpu[M,C,H,W], feats[M,Df])}`` from
-                :meth:`build_banks`; must contain every id present in ``labels``.
+            labels (Tensor): ``[B]`` per-point label (null_label -> null bank).
+            cond_banks, null_banks (list): per-trajectory ``(latents_cpu, feats)``.
         Returns:
             Tensor: ``[B, C, H, W]`` posterior-mean data ``x0_hat``.
         """
@@ -190,24 +210,20 @@ class EmpiricalExpert(nn.Module):
         labels_cpu = labels.to('cpu').long()
         out = torch.empty_like(x_t)
 
-        for c in torch.unique(labels_cpu):
-            ci = int(c)
-            rows = (labels_cpu == ci).nonzero(as_tuple=True)[0]
-            lat_cpu, feat_m = banks[ci]                 # [M,C,H,W] cpu, [M,Df] device
+        for i in range(B):
+            lat_cpu, feat_m = (null_banks[i] if int(labels_cpu[i]) == null_label
+                               else cond_banks[i])
             M = feat_m.shape[0]
-            rows_d = rows.to(device)
-            sc = sigma[rows_d].clamp_min(self.min_sigma)       # [n_c]
-            xf = x_feat_all[rows_d]                            # [n_c, Df]
-
-            resid = xf.unsqueeze(1) - (1 - sc).view(-1, 1, 1) * feat_m.unsqueeze(0)
-            d2 = resid.pow(2).sum(-1) / (2.0 * sc.view(-1, 1) ** 2)  # [n_c, M]
-            w = torch.softmax(-d2, dim=1)                           # [n_c, M]
-
-            acc = torch.zeros((rows.numel(), *x_t.shape[1:]), device=device, dtype=out.dtype)
+            sc = sigma[i].clamp_min(self.min_sigma)       # scalar
+            xf = x_feat_all[i]                            # [Df]
+            resid = xf.unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
+            d2 = resid.pow(2).sum(-1) / (2.0 * sc ** 2)   # [M]
+            w = torch.softmax(-d2, dim=0)                 # [M]
+            acc = torch.zeros(x_t.shape[1:], device=device, dtype=out.dtype)
             for b0 in range(0, M, self.bank_chunk):
                 b1 = min(b0 + self.bank_chunk, M)
-                full = lat_cpu[b0:b1].to(device).view(1, b1 - b0, *x_t.shape[1:])
-                acc += (w[:, b0:b1].view(rows.numel(), b1 - b0, *([1] * (x_t.dim() - 1))) * full).sum(1)
-            out[rows_d] = acc
+                full = lat_cpu[b0:b1].to(device).float()  # [blk, C, H, W]
+                acc += (w[b0:b1].view(-1, *([1] * (x_t.dim() - 1))) * full).sum(0)
+            out[i] = acc
 
         return out

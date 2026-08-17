@@ -57,6 +57,7 @@ class GaussianFlowDagger(GaussianFlow):
                  complement_mode='project',
                  roll_weight='proportional',
                  t_split=None,
+                 frac_on_path=0.5,
                  onpath_expert_vel=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -78,6 +79,13 @@ class GaussianFlowDagger(GaussianFlow):
         # rollout/expert stream covers sigma >= t_split (noise side). None -> no split
         # (on-path over the full range, buffer over whatever the hook captures).
         self.t_split = t_split
+        # fraction of the HIGH-sigma (>= t_split) budget drawn from REAL data (on-path
+        # FM, true velocity) instead of expert-labelled rollout states -- blends true
+        # velocities into the rollout region. 0 -> all rollout (old behavior), 1 -> all
+        # on-path. Only active with a t_split carve. The proportional roll_weight keeps
+        # per-point weighting uniform automatically (on-path batch grows, w = n_roll/bs).
+        assert 0.0 <= frac_on_path <= 1.0
+        self.frac_on_path = frac_on_path
         # if True, label on-path samples with the empirical expert's posterior-mean
         # velocity (using the same expert_target / complement_mode) instead of the
         # true FM residual noise - x_0. Requires the expert handle set by the wrapper.
@@ -110,6 +118,21 @@ class GaussianFlowDagger(GaussianFlow):
         while filled < num_batches:
             t = self.timestep_sampler(num_batches, seq_len=seq_len, device=device)
             ok = t[(t / self.num_timesteps) < self.t_split]
+            take = min(num_batches - filled, ok.numel())
+            if take > 0:
+                out[filled:filled + take] = ok[:take]
+                filled += take
+        return out
+
+    def _sample_t_above_split(self, num_batches, seq_len, device):
+        """On-path timesteps truncated (by rejection) to ``sigma >= t_split`` -- the
+        high-noise side, so the real-data FM mix-in (frac_on_path) shares the rollout
+        region's timestep distribution/weighting."""
+        out = torch.empty(num_batches, device=device)
+        filled = 0
+        while filled < num_batches:
+            t = self.timestep_sampler(num_batches, seq_len=seq_len, device=device)
+            ok = t[(t / self.num_timesteps) >= self.t_split]
             take = min(num_batches - filled, ok.numel())
             if take > 0:
                 out[filled:filled + take] = ok[:take]
@@ -151,10 +174,13 @@ class GaussianFlowDagger(GaussianFlow):
         else:  # 'full'
             return (x_t - x0_hat) / sigma_clamped
 
-    def _onpath_loss(self, x_0, truncate, use_expert, **kwargs):
+    def _onpath_loss(self, x_0, truncate, use_expert, n_above=0, **kwargs):
         """On-path GaussianFlow loss with optional sigma-truncation (``sigma <
         t_split``) and optional empirical-expert velocity labelling (mirrors
-        GaussianFlow.forward_train)."""
+        GaussianFlow.forward_train). ``n_above`` of the rows are instead drawn from
+        ``sigma >= t_split`` (the frac_on_path real-data mix-in into the rollout
+        region); every row still gets a full-weight FM target, so per-point weighting
+        stays uniform across timesteps."""
         assert self.repa_loss is None, \
             't_split / onpath_expert_vel are not supported together with repa_loss.'
         device = get_module_device(self)
@@ -162,7 +188,14 @@ class GaussianFlowDagger(GaussianFlow):
         seq_len = x_0.shape[2:].numel()
         eps = self.train_cfg.get('eps', 1e-4)
         if truncate:
-            t = self._sample_t_below_split(num_batches, seq_len, device)
+            n_above = max(0, min(int(n_above), num_batches))
+            n_below = num_batches - n_above
+            parts = []
+            if n_below > 0:
+                parts.append(self._sample_t_below_split(n_below, seq_len, device))
+            if n_above > 0:
+                parts.append(self._sample_t_above_split(n_above, seq_len, device))
+            t = torch.cat(parts, dim=0)
         else:
             min_raw_t = self.train_cfg.get('min_raw_t', 0.0)
             max_raw_t = self.train_cfg.get('max_raw_t', 1.0)
@@ -198,18 +231,22 @@ class GaussianFlowDagger(GaussianFlow):
             visual_encoder_features=None,
             running_status=None,
             buffer_batch=None,
+            n_onpath_high=0,
             **kwargs):
         # On-path GaussianFlow velocity-MSE loss. A split (t_split with an active
         # buffer) restricts on-path to sigma < t_split; onpath_expert_vel relabels
         # on-path targets with the expert. Either path uses the reimplemented
         # _onpath_loss; otherwise defer to the base full-range implementation.
+        # n_onpath_high (from the wrapper carve) = on-path rows that are the
+        # frac_on_path real-data mix-in at sigma >= t_split.
         use_split = self.t_split is not None and buffer_batch is not None
         expert = self._dagger_expert
         use_expert = (self.onpath_expert_vel and expert is not None
                       and expert.ready and 'class_labels' in kwargs)
         if use_split or use_expert:
             loss, log_vars = self._onpath_loss(
-                x_0, truncate=use_split, use_expert=use_expert, **kwargs)
+                x_0, truncate=use_split, use_expert=use_expert,
+                n_above=n_onpath_high, **kwargs)
         else:
             loss, log_vars = super().forward_train(
                 x_0,

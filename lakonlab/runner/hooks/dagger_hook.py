@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Hansheng Chen
 
+import gc
+
 import torch
 
 from mmcv.parallel import is_module_wrapper
@@ -72,6 +74,7 @@ class DaggerRolloutHook(Hook):
                  n_rollout,
                  nfe,
                  latent_size,
+                 start_iter=0,
                  num_classes=1000,
                  null_label=1000,
                  prob_class=None,
@@ -84,6 +87,7 @@ class DaggerRolloutHook(Hook):
                  aggregate_buffer=False,
                  sampler='FlowHeunODE'):
         self.round_interval = round_interval
+        self.start_iter = start_iter  # delay first rollout round -> optimizer/LR warmup on pure on-path FM
         self.n_rollout = n_rollout
         self.nfe = nfe
         self.latent_size = tuple(latent_size)
@@ -110,7 +114,10 @@ class DaggerRolloutHook(Hook):
         return runner.model.module if is_module_wrapper(runner.model) else runner.model
 
     def before_train_iter(self, runner):
-        if self.round_interval <= 0 or runner.iter % self.round_interval != 0:
+        # warmup: no rollout rounds until start_iter (pure on-path FM first, so the
+        # optimizer settles at the new LR before the DAGGER stream is introduced).
+        if self.round_interval <= 0 or runner.iter < self.start_iter \
+                or runner.iter % self.round_interval != 0:
             return
         model = self._unwrap(runner)
         # wait until the reservoir has enough real data to form a bank
@@ -173,7 +180,6 @@ class DaggerRolloutHook(Hook):
                 # points to null). NB: null points then come from the conditional
                 # (class-marginal) state distribution, not the unconditional one.
                 class_labels = labels
-                needed = set(labels.tolist()) | {self.null_label}
             else:
                 # DEFAULT: trajectory-level CFG dropout applied BEFORE generation, so a
                 # dropped trajectory is GENERATED unconditionally and stays on-policy
@@ -185,10 +191,11 @@ class DaggerRolloutHook(Hook):
                     train_labels = torch.where(
                         keep, labels, torch.full_like(labels, self.null_label))
                 class_labels = train_labels
-                needed = set(train_labels.tolist())
 
-            # load the per-class disk banks this chunk needs (freed after the chunk).
-            banks = model.expert.build_banks(needed, encode_fn, feat_fn, device)
+            # per-trajectory banks: each row gets its OWN conditional (drawn from its
+            # sampled class) + null (whole-dataset) bank. x0_hat picks cond/null per
+            # captured point via point_labels; no per-class or shared-null pooling.
+            cond_banks, null_banks = model.expert.build_banks(labels, encode_fn, feat_fn, device)
 
             test_cfg_override = dict(sampler=self.sampler, num_timesteps=self.nfe)
 
@@ -209,7 +216,7 @@ class DaggerRolloutHook(Hook):
                     else:
                         point_labels = train_labels
                     x0_hat = model.expert.x0_hat(
-                        x_t, sigma, feat_fn, point_labels, banks)
+                        x_t, sigma, feat_fn, point_labels, cond_banks, null_banks, self.null_label)
                     captured.append((x_t.detach().cpu(), sigma,
                                      x0_hat.detach().cpu(), point_labels.detach().cpu()))
                 return kw
@@ -222,7 +229,10 @@ class DaggerRolloutHook(Hook):
                 sample_callback=sample_callback)
 
             model.dagger_buffer.extend(captured)
-            del banks
+            # free this chunk's banks promptly (they can be tens of GB with entire
+            # banks x 4 ranks); gc.collect breaks any closure cycle holding them.
+            del cond_banks, null_banks
+            gc.collect()
 
         if was_training:
             diffusion.train()

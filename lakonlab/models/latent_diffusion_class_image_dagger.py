@@ -55,14 +55,24 @@ class LatentDiffusionClassImageDagger(LatentDiffusionClassImage):
             # n_on = round(bs * (1 - p_high)), n_roll = bs - n_on. Only the first
             # n_on dataloader rows are used on-path; the rest of the batch budget
             # goes to expert-labelled rollout states.
+            # frac_on_path blends REAL data (on-path FM) into the high-sigma region:
+            # of the n_high (>= t_split) budget, n_high_on are on-path and the rest
+            # are expert-labelled rollout. n_on + n_high_on + n_roll = bs, so the
+            # per-point weighting stays uniform (proportional roll_weight -> w=n_roll/bs).
             p_high = rgetattr(self.diffusion, 'high_sigma_fraction')()
-            n_on = int(round(bs * (1 - p_high)))
+            frac_on_path = rgetattr(self.diffusion, 'frac_on_path', 0.0)
+            n_on = int(round(bs * (1 - p_high)))        # low-sigma on-path (< t_split)
             n_on = max(1, min(n_on, bs - 1))
-            n_roll = bs - n_on
+            n_high = bs - n_on                           # high-sigma budget (>= t_split)
+            n_high_on = int(round(n_high * frac_on_path))   # real-data FM mixed into it
+            n_roll = n_high - n_high_on                  # expert-labelled rollout states
+            n_onpath = n_on + n_high_on                  # total real-data on-path rows
             diffusion_args = tuple(
-                a[:n_on] if torch.is_tensor(a) else a for a in diffusion_args)
+                a[:n_onpath] if torch.is_tensor(a) else a for a in diffusion_args)
             if torch.is_tensor(diffusion_kwargs.get('class_labels', None)):
-                diffusion_kwargs['class_labels'] = diffusion_kwargs['class_labels'][:n_on]
+                diffusion_kwargs['class_labels'] = diffusion_kwargs['class_labels'][:n_onpath]
+            # how many on-path rows are the high-sigma (>= t_split) mix-in
+            diffusion_kwargs['n_onpath_high'] = n_high_on
             diffusion_kwargs['buffer_batch'] = self._sample_buffer(diffusion_args[0], n_roll)
         else:
             # no split: keep the full on-path batch and add rollout rows on top.

@@ -2,11 +2,11 @@ name = 'asymflow_h_16_r8_imagenet_dagger_4gpus'
 
 
 # --- finetuning schedule (from the released checkpoint) ---
-steps_per_epoch = 2502  # 1.28M / (4 gpus * 128)
+steps_per_epoch = 1251  # 1.28M / (4 gpus * 256)
 # short comparison run: 10 DAGGER rounds (round_interval=500 -> 10 * 500 = 5000 iters),
 # enough to get signal on dagger vs regular finetuning.
 total_iters = 5000
-warmup_iters = 200
+warmup_iters = 500   # optimizer/LR warmup on pure on-path FM; DAGGER rounds start after this
 save_interval = 2500
 must_save_interval = 5000
 eval_interval = 500     # eval (10k FID) + trajectory viz every 500 iters (10 evals over 5000)
@@ -38,8 +38,9 @@ model = dict(
         data_root='data/imagenet/train/',
         image_size=256,
         num_classes=1000,
-        bank_size=None,      # None -> ENTIRE class per bank (all its images, <=1300)
-        null_bank_size=512,  # unconditional bank cap (never load the whole dataset)
+        bank_size=128,       # real images per class (x2 with include_flips)
+        null_bank_size=256,  # per-trajectory null bank (x2 flips=512); each traj draws its own
+        include_flips=True,  # bank holds BOTH h-orientations of every image (2x support, bf16 stored)
         num_workers=32,      # parallel image load/decode threads
         sample_chunk=32,     # rows per chunk in x0_hat
         bank_chunk=128,      # bank entries summed at once (peak ~ chunk*bank_chunk latents)
@@ -56,6 +57,10 @@ model = dict(
         # was ~13x over-weighted vs its point share).
         roll_weight='proportional',
         t_split=t_split,
+        # blend real data (on-path FM) into the high-sigma rollout region: fraction of
+        # the sigma>=t_split budget that is real-data FM (true velocity) vs expert
+        # rollout. 0.5 -> half the high-sigma points are real data, half expert.
+        frac_on_path=0.5,
         # label on-path samples with the empirical expert velocity instead of the
         # true FM residual (noise - x_0). Set False to keep standard FM on-path.
         onpath_expert_vel=False,
@@ -85,6 +90,12 @@ model = dict(
             upcast_attention=True,
             fused_attention=True,
             compile_forward=True,
+            # mode='default' = inductor WITHOUT cuda graphs. The default
+            # 'reduce-overhead' captures a cudagraph pool per input shape, and the
+            # DAGGER pipeline feeds many shapes (on-path carve, buffer, rollout
+            # forward_test, eval) -> the pools balloon to 100+ GB and OOM the GPU at
+            # bs=256. 'default' keeps inductor's fusion/memory savings, no pools.
+            compile_kwargs=dict(mode='default', fullgraph=True, dynamic=False),
             checkpointing=True,
             sigma_min=4e-2,  # AsymFlow inference clamp
         ),
@@ -118,7 +129,7 @@ test_cfg = dict()
 optimizer = {
     'diffusion': dict(
         type='AdamW',
-        lr=5e-5,  # lowered for finetuning
+        lr=2.5e-4,  # slightly above the base model's training LR (2e-4, at 8 gpus) so the model actively moves
         betas=(0.9, 0.95),
         weight_decay=0.0,
         fused=True,
@@ -132,8 +143,9 @@ data = dict(
         data_root='data/imagenet/train/',
         datalist_path='data/imagenet/train.txt',
         negative_label=1000,
+        random_flip=True,   # h-flip aug (default); bank construction matches this
         image_size=256),
-    train_dataloader=dict(samples_per_gpu=128),
+    train_dataloader=dict(samples_per_gpu=256),
     val=dict(
         type='ImageNet',
         data_root='data/imagenet/train/',
@@ -230,6 +242,7 @@ custom_hooks = [
     dict(
         type='DaggerRolloutHook',
         round_interval=round_interval,
+        start_iter=warmup_iters,   # no DAGGER rounds until the optimizer warmup completes
         n_rollout=n_rollout,
         nfe=rollout_nfe,
         latent_size=latent_size,
@@ -240,7 +253,8 @@ custom_hooks = [
         # t_split omitted -> inherits diffusion.t_split (0.88); captures sigma >= t_split.
         # smaller chunk -> fewer per-class banks held at once (all 4 ranks build
         # banks simultaneously); keeps host RAM modest with entire-class banks.
-        rollout_chunk=16,
+        # 8 halves the concurrent-bank peak (~35 GB across ranks) to fit --mem=300G.
+        rollout_chunk=8,
         guidance_scale=1.0,   # unguided: conditional-no-CFG or unconditional (guarded in the hook)
         label_time_dropout=True,         # always-conditional rollout; CFG dropout per captured point
         class_sampling='proportional',   # rollout classes ~ dataset prior (like on-path)
