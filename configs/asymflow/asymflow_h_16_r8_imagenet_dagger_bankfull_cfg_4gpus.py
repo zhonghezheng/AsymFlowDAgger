@@ -121,6 +121,14 @@ _clstag += '' if _ubk == 2048 else f'_ub{_ubk}'
 # off the default, so every existing run name is unchanged.
 _kspace = os.environ.get('LAKON_KERNEL_SPACE', 'feat')
 _clstag += '' if _kspace == 'feat' else '_klat'
+# per-GPU batch. Default 256 = the 4xH200 layout every run so far used (global 1024).
+# For 8 GPUs set 128: global batch stays 1024, per-GPU activations halve (the 256
+# layout peaks ~130 GB, over an 80 GB H100), no grad accumulation is needed so
+# mmd_accum_steps=1 stays correct, and the band's trajectory count -- round(p_high *
+# per-GPU batch) -- stays matched in total (8 x ~10-11 vs 4 x 21). Tagged when off
+# default so an 8-GPU run can never share a name with its 4-GPU counterpart.
+_spg = int(os.environ.get('LAKON_SAMPLES_PER_GPU', 256))
+_clstag += '' if _spg == 256 else f'_bs{_spg}'
 name = ('asymflow_h_16_r8_imagenet_dagger_bankfull_'
         f'{_cmtag}{_w}_f{_ftag}{_clstag}_4gpus')
 work_dir = f'work_dirs/{name}'
@@ -199,3 +207,5 @@ custom_hooks = [
         interp_cfg=dict(momentum=0.9999),
         priority='VERY_HIGH'),
 ]
+
+data = dict(train_dataloader=dict(samples_per_gpu=_spg))
