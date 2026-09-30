@@ -30,3 +30,9 @@ build/
 *.env
 .DS_Store
 .claude/
+# wandb offline runs + the on-scratch cache/staging dirs (see sbatch_scripts/wandb_env.sh)
+/wandb/
+/.wandb_cache/
+/.wandb_data/
+/.wandb_artifacts/
+/direct_outputs/

@@ -54,11 +54,13 @@ class GaussianFlowDagger(GaussianFlow):
 
     def __init__(self,
                  *args,
-                 complement_mode='project',
+                 complement_mode='full',
                  roll_weight='proportional',
                  t_split=None,
                  frac_on_path=0.5,
                  onpath_expert_vel=False,
+                 cfg_gap_weight=0.0,
+                 cfg_null_label=1000,
                  **kwargs):
         super().__init__(*args, **kwargs)
         assert complement_mode in ('project', 'full')
@@ -90,6 +92,22 @@ class GaussianFlowDagger(GaussianFlow):
         # velocity (using the same expert_target / complement_mode) instead of the
         # true FM residual noise - x_0. Requires the expert handle set by the wrapper.
         self.onpath_expert_vel = onpath_expert_vel
+        # Optional CFG-gap term on the ROLLOUT (on-policy) points, added OUTSIDE the
+        # convex DAGGER combination so that cfg_gap_weight=0 reproduces the DAGGER
+        # objective bit-for-bit:
+        #     loss = (1-w)*mean_onpath + w*mean_rollout
+        #          + cfg_gap_weight * mean_rollout|| (v_cond - v_uncond)
+        #                                           - (v*_cond - v*_uncond) ||^2
+        # It pins the model's CFG DIRECTION (the axis inference extrapolates along)
+        # to the empirical one -- how much the expert's posterior mean moves when the
+        # class is revealed -- and is blind to error common to both branches, which
+        # the rollout FM term already handles. Requires DaggerRolloutHook with
+        # store_cfg_targets=True: the buffer's own x0_hat is cond OR null per row
+        # (dropout applied at label time) and cannot form a difference.
+        self.cfg_gap_weight = float(cfg_gap_weight)
+        # null/CFG-embedding slot for the gap's unconditional branch; must match the
+        # dataset's negative_label and the hook's null_label.
+        self.cfg_null_label = int(cfg_null_label)
         self._p_high = None  # cached logit-normal mass at sigma >= t_split
         # non-registered handle to the wrapper's EmpiricalExpert (set via
         # object.__setattr__ so it is NOT a submodule -> stays out of EMA/DDP/tying).
@@ -158,7 +176,7 @@ class GaussianFlowDagger(GaussianFlow):
         return p.unpatchify(
             p.unpack(sub, h // p.patch_size, w // p.patch_size), p.patch_size)
 
-    def expert_target(self, x_t, sigma, x0_hat):
+    def expert_target(self, x_t, sigma, x0_hat, mode=None):
         """Expert velocity target ``L`` at visited states (already ``/sigma_clamped``,
         i.e. in the same clamp-weighted velocity space as GaussianFlow's ``u_t``).
 
@@ -168,7 +186,7 @@ class GaussianFlowDagger(GaussianFlow):
         ``clamp_coef`` weighting near sigma->0)."""
         sig = sigma.reshape(x_t.size(0), *([1] * (x_t.dim() - 1))).to(x_t)
         _, sigma_clamped, clamp_coef = self.get_clamp_coef(sigma=sig, x_t=x_t)
-        if self.complement_mode == 'project':
+        if (mode or self.complement_mode) == 'project':
             return self.project_fn(x_t - (1 - sig) * x0_hat) / sigma_clamped \
                 - clamp_coef * x0_hat
         else:  # 'full'
@@ -280,5 +298,35 @@ class GaussianFlowDagger(GaussianFlow):
             loss = (1.0 - w) * loss + w * roll_loss
             log_vars['loss_dagger'] = roll_loss.detach()
             log_vars['roll_weight'] = roll_loss.new_tensor(w)
+
+            if self.cfg_gap_weight != 0:
+                assert 'x0_cond' in buffer_batch, (
+                    'cfg_gap_weight needs both expert estimates per rollout point; '
+                    'set store_cfg_targets=True on the DaggerRolloutHook.')
+                # one batched forward over [x_t; x_t] with [true labels; null], so
+                # both branches see identical states. The TRUE labels are used: a row
+                # relabelled to null by the dropout would compare the unconditional
+                # branch against itself and contribute an exact zero.
+                lab_t = buffer_batch['labels_true']
+                both = torch.cat([x_t, x_t], dim=0)
+                cond_null = torch.cat(
+                    [lab_t, torch.full_like(lab_t, self.cfg_null_label)], dim=0)
+                out2 = self.pred(both, torch.cat([t, t], dim=0), class_labels=cond_null)
+                v_cond, v_uncond = out2.chunk(2, dim=0)
+                v_cond = v_cond * clamp_coef
+                v_uncond = v_uncond * clamp_coef
+                vs_cond = self.expert_target(x_t, sigma, buffer_batch['x0_cond'])
+                vs_uncond = self.expert_target(x_t, sigma, buffer_batch['x0_null'])
+                gap = ((v_cond - v_uncond) - (vs_cond - vs_uncond)).pow(2).mean()
+                loss = loss + self.cfg_gap_weight * gap
+                log_vars['cfg_gap'] = gap.detach()
+                log_vars['loss_cfg_gap'] = (self.cfg_gap_weight * gap).detach()
+                with torch.no_grad():
+                    a = v_cond - vs_cond
+                    b = v_uncond - vs_uncond
+                    af, bf = a.flatten(1), b.flatten(1)
+                    log_vars['cfg_cos'] = (
+                        (af * bf).sum(-1) / af.norm(dim=-1).clamp_min(1e-6)
+                        / bf.norm(dim=-1).clamp_min(1e-6)).mean()
 
         return loss, log_vars

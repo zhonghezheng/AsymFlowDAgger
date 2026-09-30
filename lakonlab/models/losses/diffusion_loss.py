@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from copy import deepcopy
 from functools import partial
@@ -89,6 +90,60 @@ class DiffusionLoss(nn.Module):
         """
 
         return loss * scale
+
+    @staticmethod
+    def logit_normal_rescale(loss, timesteps, mean=0.0, std=1.0, scale=1.0,
+                             num_timesteps=1, shift=1.0, max_weight=None,
+                             eps=1e-6):
+        """Reweight UNIFORMLY-sampled timesteps to carry the logit-normal mass.
+
+        Equivalent in expectation to *sampling* ``raw_t ~ logit-normal(mean, std)``
+        (``ContinuousTimeStepSampler(logit_normal_enable=True)``), but decoupled
+        from it: timesteps are visited uniformly and each point's loss is scaled by
+        the logit-normal density at that point,
+
+            w(raw_t) = N(logit(raw_t); mean, std) / (raw_t * (1 - raw_t))
+
+        which is exactly the importance ratio ``p_logitnormal(raw_t) / p_uniform(raw_t)``.
+        Since ``E_{raw_t ~ U(0,1)}[w] = 1`` by construction, the loss scale (hence a
+        tuned LR) is preserved relative to the sampled version -- only the variance
+        and the sigma coverage differ: every batch now spans the whole sigma range
+        while the *weighting* stays the pretraining one.
+
+        IMPORTANT: this is mutually exclusive with
+        ``timestep_sampler.logit_normal_enable=True`` -- enabling both applies the
+        mass twice (``GaussianFlow.__init__`` asserts against it).
+
+        ``shift`` must match the sampler's: the weight is a density in RAW t, so a
+        warped sigma is unwarped first (identity at ``shift=1.0``).
+
+        Args:
+            loss (torch.Tensor): Per-point losses, shape [B].
+            timesteps (torch.Tensor): Timesteps of each loss item, in
+                ``[0, num_timesteps]``.
+            mean (float): logit-normal mean (in logit space).
+            std (float): logit-normal std (in logit space).
+            scale (float): extra constant factor, as in ``constant_rescale``.
+            num_timesteps (int): to map timesteps -> sigma.
+            shift (float): the sampler's timestep warp.
+            max_weight (float | None): optional clamp on the weight, to bound the
+                gradient contribution of any single point. ``None`` -> unclamped
+                (the density is bounded anyway: it -> 0 at both ends).
+            eps (float): clamp keeping ``logit`` finite at the endpoints.
+
+        Returns:
+            torch.Tensor: Rescaled losses.
+        """
+        sigma = timesteps.to(loss) / num_timesteps
+        # density lives in raw t; undo the sampler's warp (identity at shift=1)
+        raw_t = sigma if shift == 1.0 else sigma / (shift + (1 - shift) * sigma)
+        raw_t = raw_t.clamp(min=eps, max=1 - eps)
+        logit = torch.log(raw_t) - torch.log1p(-raw_t)
+        weight = torch.exp(-0.5 * ((logit - mean) / std) ** 2) / (
+            std * math.sqrt(2 * math.pi) * raw_t * (1 - raw_t))
+        if max_weight is not None:
+            weight = weight.clamp(max=max_weight)
+        return loss * weight * scale
 
     @staticmethod
     def timestep_weight_rescale(loss, timesteps, weight, scale=1):

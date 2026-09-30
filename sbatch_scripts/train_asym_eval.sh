@@ -27,6 +27,7 @@ export MASTER_PORT=$((10000 + RANDOM % 20000))
 # can't reach api.wandb.ai) -- env overrides config, so it can never hang online.
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
+source "$PROJ/sbatch_scripts/wandb_env.sh"
 
 NGPU=$(nvidia-smi -L | wc -l)
 CONFIG=configs/asymflow/asymflow_h_16_r8_imagenet_dagger_smoke_eval.py

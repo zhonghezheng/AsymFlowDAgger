@@ -30,6 +30,7 @@ export MASTER_PORT=$((10000 + RANDOM % 20000))
 # hits the network (compute nodes have no internet).
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
+source "$PROJ/sbatch_scripts/wandb_env.sh"
 
 NGPU=$(nvidia-smi -L | wc -l)
 CONFIG=configs/asymflow/asymflow_h_16_r8_imagenet_eval50k.py

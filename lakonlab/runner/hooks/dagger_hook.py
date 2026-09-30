@@ -85,6 +85,7 @@ class DaggerRolloutHook(Hook):
                  class_sampling='uniform',
                  use_ema_rollout=False,
                  aggregate_buffer=False,
+                 store_cfg_targets=False,
                  sampler='FlowHeunODE'):
         self.round_interval = round_interval
         self.start_iter = start_iter  # delay first rollout round -> optimizer/LR warmup on pure on-path FM
@@ -107,6 +108,12 @@ class DaggerRolloutHook(Hook):
         self.class_sampling = class_sampling
         self.use_ema_rollout = use_ema_rollout
         self.aggregate_buffer = aggregate_buffer
+        # Also store the CONDITIONAL and NULL expert estimates (and the undropped
+        # labels) per captured point, so a CFG-gap term can form
+        # (v*_cond - v*_uncond) at train time. Costs 2 extra weighted averages per
+        # point during the round (banks already in hand) and 2x the buffer's x0_hat
+        # memory; the DAGGER loss itself is untouched and still reads x0_hat[label].
+        self.store_cfg_targets = store_cfg_targets
         self.sampler = sampler
 
     @staticmethod
@@ -217,8 +224,27 @@ class DaggerRolloutHook(Hook):
                         point_labels = train_labels
                     x0_hat = model.expert.x0_hat(
                         x_t, sigma, feat_fn, point_labels, cond_banks, null_banks, self.null_label)
-                    captured.append((x_t.detach().cpu(), sigma,
-                                     x0_hat.detach().cpu(), point_labels.detach().cpu()))
+                    if self.store_cfg_targets:
+                        # Both expert velocities at the SAME state, for a CFG-gap term
+                        # downstream: x0_hat above uses the dropout-applied label, so
+                        # it is cond OR null per row and cannot form a difference.
+                        # The banks are already built, so each extra call is one more
+                        # weighted average -- no additional image IO.
+                        all_null = torch.full_like(labels, self.null_label)
+                        x0_cond = model.expert.x0_hat(
+                            x_t, sigma, feat_fn, labels, cond_banks, null_banks,
+                            self.null_label)
+                        x0_null = model.expert.x0_hat(
+                            x_t, sigma, feat_fn, all_null, cond_banks, null_banks,
+                            self.null_label)
+                        captured.append((
+                            x_t.detach().cpu(), sigma, x0_hat.detach().cpu(),
+                            point_labels.detach().cpu(),
+                            x0_cond.detach().cpu(), x0_null.detach().cpu(),
+                            labels.detach().cpu()))   # TRUE labels, never dropped
+                    else:
+                        captured.append((x_t.detach().cpu(), sigma,
+                                         x0_hat.detach().cpu(), point_labels.detach().cpu()))
                 return kw
 
             net.forward_test(

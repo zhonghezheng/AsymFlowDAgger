@@ -16,15 +16,36 @@ latent_size = (3, 256, 256)
 round_interval = 500     # iters between rollout rounds (10 rounds over 5000 iters)
 n_rollout = 1024         # trajectories/round per rank (~2.9x buffer reuse; fits 600G at K=128)
 rollout_nfe = 50         # Heun steps per rollout, matching the eval sampler (FlowHeunODE, 50)
+# --- timestep mass (shared by DAGGER and regft) ---
+# The released checkpoint was PRETRAINED with the logit-normal applied as the
+# timestep SAMPLING distribution. Here the same mass is applied as an explicit
+# per-point LOSS WEIGHT over uniformly-sampled timesteps instead (sampler
+# logit_normal_enable=False + flow_loss rescale_mode='logit_normal'). Identical in
+# expectation to the pretraining objective -- E[w] = 1, so loss scale and LR carry
+# over -- but it decouples two things the sampled version conflated:
+#   1. sigma COVERAGE: every batch now spans the full range, so the high-sigma
+#      DAGGER region gets p_high = 1 - t_split = 0.12 of the points (vs 0.068 when
+#      the logit-normal did the sampling) -> ~2x the rollout rows, less variance.
+#   2. sigma WEIGHTING: restored to the pretraining logit-normal via w(raw_t), so
+#      the high-sigma points are down-weighted by 0.068/0.12 = 0.567 and the total
+#      mass per region matches pretraining exactly.
+# Net effect: more samples where DAGGER acts, same objective as the base model.
+flow_shift = 1.0             # sampler warp; must match flow_loss rescale_cfg.shift
+logit_normal_mean = 0.8      # pretraining values (asymflow_h_16_r8_imagenet_8gpus.py)
+logit_normal_std = 0.8
 # timestep split: on-path FM covers sigma < t_split (data side), DAGGER rollout/
 # expert covers sigma >= t_split (noise side). Each train minibatch is carved to a
-# fixed batch_size, split by the base logit-normal mass p_high = P(sigma >= t_split):
-# n_on = round(bs*(1-p_high)) on-path points, n_roll = bs - n_on rollout points.
+# fixed batch_size, split by the base timestep mass p_high = P(sigma >= t_split),
+# MC-estimated from timestep_sampler itself -- UNIFORM now, so p_high = 1 - t_split
+# = 0.12: n_on = round(bs*(1-p_high)) on-path points, n_roll = bs - n_on rollout
+# points. The logit-normal loss weight then restores the correct mass per region.
 # 0.88 aligns the expert coverage (sigma >= 0.88) with the eval CFG interval's
 # no-guidance tail (guidance_interval=[0,0.88] -> CFG off for sigma > 0.88), so
 # DAGGER corrects exactly the high-noise region that inference leaves unguided.
-t_split = 0.88
-complement_mode = 'project'  # 'project' (derived asym loss) | 'full' (keep complement noise)
+t_split = 0.92
+complement_mode = 'full'  # PINNED: 'full' is the ASSEMBLED form of the derived
+# asym target (AsymFlow Eq. 3 + Eq. 5); the loss compares assembled velocities, so
+# 'project' would put a raw-head-space target against an assembled prediction.
 
 model = dict(
     type='LatentDiffusionClassImageDagger',
@@ -52,9 +73,12 @@ model = dict(
         type='GaussianFlowDagger',
         complement_mode=complement_mode,
         # convex loss mix: (1-w)*mean_onpath + w*mean_rollout. 'proportional' sets
-        # w = n_roll/bs (~0.07 at t_split=0.88), so on-path + rollout form a single
-        # per-point mean over the batch (was additive w/ roll_weight=1 -> rollout
-        # was ~13x over-weighted vs its point share).
+        # w = n_roll/bs from the POINT COUNTS, which keeps the mix exact under the
+        # logit-normal loss weight too: each point ends up contributing wt_i/bs
+        # (wt_i = the rescale weight), i.e. one weighted mean over the whole batch.
+        # With uniform sampling, t_split=0.88, bs=256, frac_on_path=0.5:
+        # n_on=225, n_high=31, n_high_on=16, n_roll=15 -> w = 15/256 ~= 0.059 of the
+        # POINTS, carrying ~0.059 * 0.567 ~= 0.033 of the MASS after reweighting.
         roll_weight='proportional',
         t_split=t_split,
         # blend real data (on-path FM) into the high-sigma rollout region: fraction of
@@ -102,16 +126,29 @@ model = dict(
         flow_loss=dict(
             type='DiffusionMSELoss',
             data_info=dict(pred='u_t_pred', target='u_t'),
-            rescale_mode='constant',
-            rescale_cfg=dict(scale=2.0),  # LakonLab MSE loss has a internal 0.5 factor, so use 2.0
+            # logit-normal mass as a per-point WEIGHT over uniform timesteps (see the
+            # timestep-mass note at the top). Applied inside flow_loss, so it covers
+            # every stream that routes through it: regft's plain FM loss, DAGGER's
+            # on-path loss (both the sigma<t_split rows and the frac_on_path
+            # high-sigma mix-in), and DAGGER's expert-labelled rollout term.
+            rescale_mode='logit_normal',
+            rescale_cfg=dict(
+                scale=2.0,  # LakonLab MSE loss has a internal 0.5 factor, so use 2.0
+                mean=logit_normal_mean,
+                std=logit_normal_std,
+                num_timesteps=1,  # must match diffusion.num_timesteps below
+                shift=flow_shift,
+            ),
         ),
         num_timesteps=1,
         timestep_sampler=dict(
             type='ContinuousTimeStepSampler',
-            shift=1.0,
-            logit_normal_enable=True,
-            logit_normal_mean=0.8,
-            logit_normal_std=0.8,
+            shift=flow_shift,
+            # UNIFORM sampling: sigma ~ U(0, 1) (shift=1.0 -> warp_t is the identity).
+            # The logit-normal mass is NOT dropped -- it moves to flow_loss as an
+            # explicit per-point weight (rescale_mode='logit_normal'). Must stay False
+            # here or the mass is applied twice; GaussianFlow.__init__ asserts this.
+            logit_normal_enable=False,
         ),
         denoising_mean_mode='U',
         sigma_min=5e-2,  # training loss weight clamp (same as JiT's official 5e-2)
@@ -221,12 +258,8 @@ log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
-        # training losses (loss_diffusion, loss_dagger) + eval metrics (FID, ...)
-        # flow through the log buffer to wandb automatically. OFFLINE: compute
-        # nodes can't reach api.wandb.ai -> `wandb sync` from the login node after.
-        dict(
-            type='WandbLoggerHook',
-            init_kwargs=dict(project='asymflow-dagger', name=name, mode='offline')),
+        # wandb removed: the shared scratch fileset is full -> avoid the offline-run
+        # writes. FID / losses still go to the text log (slurm .out) + tf events.
     ])
 
 custom_hooks = [
@@ -262,21 +295,7 @@ custom_hooks = [
         use_ema_rollout=False,
         aggregate_buffer=False,
         priority='NORMAL'),
-    # log a denoising-trajectory image grid to wandb alongside eval
-    dict(
-        type='WandbTrajectoryHook',
-        interval=eval_interval,
-        latent_size=latent_size,
-        nfe=16,          # lighter than the full eval sampler; enough for a nice trajectory
-        n_samples=4,
-        max_cols=8,      # subsample the trajectory to 8 columns
-        num_classes=1000,
-        null_label=1000,
-        guidance_scale=guidance_scale,
-        guidance_interval=guidance_interval,
-        use_ema=True,
-        sampler='FlowHeunODE',
-        priority='LOW'),
+    # WandbTrajectoryHook removed: no wandb, and it generated extra eval-time samples.
 ]
 
 runner = dict(

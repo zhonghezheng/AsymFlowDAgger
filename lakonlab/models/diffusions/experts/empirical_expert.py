@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Hansheng Chen
 
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,17 @@ from mmcv.fileio import FileClient
 
 from ...builder import MODULES
 from lakonlab.datasets.imagenet import image_preproc
+
+
+def _load_one_u8_worker(args):
+    """Module-level (and NOT registered) so a process pool could pickle it: a bound
+    method of an expert holding tensors and a FileClient is not picklable. Returns
+    uint8 HWC. Kept module-level now that the loader is threaded, since the split
+    between path picking and decoding is still the useful shape."""
+    import os.path as _osp
+    data_root, rel_path, image_size = args
+    img = Image.open(_osp.join(data_root, rel_path)).convert('RGB')
+    return torch.from_numpy(image_preproc(img, image_size, random_flip=False))
 
 
 @MODULES.register_module()
@@ -63,12 +75,16 @@ class EmpiricalExpert(nn.Module):
                  num_classes=1000,
                  bank_size=256,
                  null_bank_size=512,
+                 null_temp=1.0,
+                 temp_spread=None,
+                 temp_spread_null_only=False,
                  random_flip=True,
                  include_flips=False,
                  num_workers=32,
                  sample_chunk=32,
                  bank_chunk=128,
-                 min_sigma=1e-3):
+                 min_sigma=1e-3,
+                 kernel_space='feat'):
         super().__init__()
         self.datalist_path = datalist_path
         self.data_root = data_root
@@ -76,13 +92,66 @@ class EmpiricalExpert(nn.Module):
         self.num_classes = num_classes
         self.bank_size = bank_size
         self.null_bank_size = null_bank_size
+        # Softmax temperature for the NULL (unconditional) bank only: d2 -> d2/T
+        # before the weights are taken. T=1 is the exact Bayes posterior over the
+        # empirical prior -- which in 2048-d feature space saturates to a single
+        # image (measured ESS ~1.1 of 2048 at sigma=0.92), so v*_uncond is a
+        # nearest-neighbour lookup rather than a posterior MEAN. Raising T restores a
+        # genuine average: T=100 measures ESS ~1022 while keeping ||v*_c - v*_u|| at
+        # 0.94x its T=1 value and v*_uncond ~1.0 bank-mean-norms from the plain bank
+        # mean. T >= 1000 degenerates to the bank mean itself (dist 0.06).
+        #
+        # Deliberately NOT applied to the conditional bank: v*_cond is the
+        # class-restricted target the emp_fm term regresses onto, and smoothing it
+        # would blur the class identity the CFG gap is supposed to isolate.
+        self.null_temp = float(null_temp)
+        # Space the posterior WEIGHTS are scored in. The weighted SUM is always over
+        # the full latents; only the softmax distances differ.
+        #   'feat'  -- the rank-8 subspace features (2048-d). Cheap, and at T=1 the
+        #              lesser evil: the log-weight spread grows ~sqrt(dims), so full-D
+        #              at T=1 is an even harder argmin. But it computes E[x0 | P x_t]:
+        #              the complement of x0_hat is averaged over images chosen without
+        #              ever consulting the complement.
+        #   'latent' -- the full 196608-d diffusion state, i.e. the same space the
+        #              on-path x_0 / x_t live in (patchify(vae.encode(img*2-1)); with
+        #              the identity RGBColorEncoder that is also pixel space). The
+        #              exact Gaussian posterior over the bank,
+        #              E[x0 | x_t]. Only sensible WITH temp_spread, which normalises the
+        #              dimension-driven spread away; at T=1 it degenerates to argmin.
+        #              Costs a second streamed pass over the bank latents per row.
+        assert kernel_space in ('feat', 'latent'), kernel_space
+        self.kernel_space = kernel_space
+        # ADAPTIVE temperature, applied to BOTH banks: divide d2 by T so that the
+        # post-scaling spread sd(d2/T) equals temp_spread. T is read off the data --
+        # T = sd(d2)/temp_spread -- so it tracks sigma, bank size and feature scale
+        # without a hard-coded constant.
+        #
+        # Why adaptive rather than the fixed null_temp: the raw spread varies ~12x
+        # across the band (measured sd 10.2 at sigma=0.98, 45 at 0.95, 119 at 0.92,
+        # 287 at 0.88), because it is (1-s)^2/(2 s^2) * sd(||Dj||^2) with
+        # sd(||Dj||^2) ~ 31,600 roughly constant. A single T therefore over-smooths
+        # one end of the band and under-smooths the other: T=100 leaves spread 1.19
+        # at sigma=0.92 but 0.10 at 0.98, i.e. essentially the plain bank mean there.
+        #
+        # Clamped to T >= 1 so this only ever SMOOTHS; where the softmax is already
+        # diffuse enough it is left alone rather than sharpened.
+        #
+        # Unlike null_temp this applies to the conditional bank too, so v*_cond
+        # becomes a class-restricted posterior MEAN rather than a nearest-neighbour
+        # lookup. Takes precedence over null_temp when set.
+        self.temp_spread = None if temp_spread is None else float(temp_spread)
+        # Restrict the adaptive temperature to the NULL bank, leaving v*_cond the
+        # exact (saturated) posterior. Isolates "smooth the unconditional branch"
+        # from "smooth both".
+        self.temp_spread_null_only = bool(temp_spread_null_only)
         self.random_flip = random_flip   # match the training augmentation (h-flip p=0.5)
         self.include_flips = include_flips  # add BOTH h-orientations of every image to the bank
         self.num_workers = num_workers
         self.sample_chunk = sample_chunk
         self.bank_chunk = bank_chunk
         self.min_sigma = min_sigma
-        self._pool = None  # lazy per-process thread pool for image loading
+        self._pool = None
+        self._proc_pool = None  # lazy per-process thread pool for image loading
 
         # class -> [rel paths]  (+ flat list for the unconditional draw)
         self._class_paths = [[] for _ in range(num_classes)]
@@ -155,10 +224,35 @@ class EmpiricalExpert(nn.Module):
         return [pool[i] for i in idx]
 
     @torch.no_grad()
-    def _build_one(self, paths, encode_fn, feat_fn, device):
-        """Load one bank from ``paths`` -> ``(latents_cpu bf16, feats)``. include_flips
-        adds both h-orientations (free, in-memory); bf16 halves the CPU latent RAM."""
-        imgs = self._load_images(paths, device)
+    def _load_images_u8(self, paths):
+        """IO half of a bank: decode ``paths`` to a uint8 CPU tensor ``[M, H, W, 3]``.
+
+        Touches no CUDA and returns CPU memory, so it can run on a prefetch thread
+        while the GPU is busy. uint8 HWC keeps the in-flight buffer a quarter of what
+        float CHW would cost -- the flip, the float conversion and the encode all
+        happen on the GPU when the bank is finished.
+        """
+        # THREADS, deliberately. Processes measure 2.7x faster on decode (3.5k ->
+        # 9.5k img/s) because PIL holds the GIL, but neither pool survives here: a
+        # FORK context deadlocks against the parent's initialised torch/CUDA (observed
+        # hanging indefinitely), and a SPAWN context died with BrokenProcessPool under
+        # the node's training load. A loader that can hang a DDP run is worse than a
+        # slower one, so the speedup is left on the table; the prefetch in
+        # GaussianFlowOnPolicy._prefetch_banks hides most of this cost anyway.
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=self.num_workers)
+        args = [(self.data_root, rp, self.image_size) for rp in paths]
+        return torch.stack(list(self._pool.map(_load_one_u8_worker, args)))
+
+    def _load_one_u8(self, rel_path):
+        img = Image.open(self.file_client.join_path(self.data_root, rel_path)).convert('RGB')
+        return torch.from_numpy(image_preproc(img, self.image_size, random_flip=False))
+
+    @torch.no_grad()
+    def _finish_bank(self, imgs_u8, encode_fn, feat_fn, device):
+        """GPU half of a bank: ``uint8 CPU [M,H,W,3]`` -> ``(latents_cpu bf16, feats)``.
+        include_flips adds both h-orientations (free, in-memory)."""
+        imgs = imgs_u8.to(device, non_blocking=True).permute(0, 3, 1, 2).float() / 255.0
         if self.include_flips:
             imgs = torch.cat([imgs, torch.flip(imgs, dims=[-1])], dim=0)
         latents = encode_fn(imgs)                 # [M, C, H, W] diffusion input space
@@ -168,23 +262,107 @@ class EmpiricalExpert(nn.Module):
         return (latents.detach().to(torch.bfloat16).cpu(), feats.detach())
 
     @torch.no_grad()
-    def build_banks(self, labels, encode_fn, feat_fn, device):
-        """Build one INDEPENDENT bank PER TRAJECTORY. For each row ``i`` (sampled
-        class ``labels[i]``): a conditional bank (``bank_size`` draw from that class)
-        AND a null bank (``null_bank_size`` draw from the whole dataset). Returns
-        ``(cond_banks, null_banks)``, each a list of ``(latents_cpu, feats)`` indexed
-        by trajectory position -- no per-class or shared-null pooling, so different
-        trajectories (even of the same class) get different posteriors.
+    def _build_one(self, paths, encode_fn, feat_fn, device):
+        """Synchronous build (IO then GPU), kept for callers that do not prefetch."""
+        return self._finish_bank(self._load_images_u8(paths), encode_fn, feat_fn, device)
+
+    def draw_bank_paths(self, labels, null_classes=None):
+        """The path draws for one bank build, WITHOUT loading anything.
+
+        Returns the opaque payload consumed by :meth:`load_bank_images` and then
+        :meth:`finish_banks`.
+
+        The CONDITIONAL side is DEDUPLICATED BY CLASS when the draw is deterministic.
+        With ``bank_size=None`` ``_draw_paths`` returns the entire class (``randperm``
+        only permutes it), and ``x0_hat`` consumes a bank as a SET -- a softmax-weighted
+        average over its rows -- so two trajectories of one class compute an identical
+        ``x0_hat`` from identical images. Loading and encoding that class once and
+        sharing it by reference is therefore exact, not an approximation. It only pays
+        off alongside ``band_classes_per_batch``: under the default 'prior' sampling
+        over 1000 classes a 21-row draw is almost all distinct and there is nothing to
+        merge.
+
+        With ``bank_size`` SET the draw is a random subset per call, so same-class rows
+        are genuinely different banks and dedup would change the statistics -- it is
+        skipped.
+
+        The NULL draw stays INDEPENDENT per trajectory (a fresh ``null_bank_size``
+        sample for every row), so trajectories keep distinct unconditional posteriors.
+        """
+        labels = labels.tolist() if torch.is_tensor(labels) else [int(x) for x in labels]
+        labels = [int(c) for c in labels]
+        if self.bank_size is None:
+            uniq = list(dict.fromkeys(labels))        # distinct classes, order kept
+            slot = {c: i for i, c in enumerate(uniq)}
+            cond_index = [slot[c] for c in labels]
+        else:                                          # random subsets -> no dedup
+            uniq = labels
+            cond_index = list(range(len(labels)))
+        return dict(
+            cond_paths=[self._draw_paths(c) for c in uniq],
+            cond_index=cond_index,
+            # null_classes restricts the UNCONDITIONAL draw to a given set of classes
+            # instead of the whole dataset. Off by default: v*_uncond is the target for
+            # the model's unconditional branch, whose null embedding is trained on the
+            # FULL marginal, so a restricted null bank makes target and prediction refer
+            # to different quantities (measured: SNR 15.8 -> 7.3, and the reference then
+            # moves every iteration with the batch's class draw). Provided so that
+            # choice can be measured rather than assumed.
+            null_paths=[self._draw_paths_restricted(null_classes)
+                        if null_classes is not None else self._draw_paths(-1)
+                        for _ in labels])
+
+    @torch.no_grad()
+    def load_bank_images(self, drawn):
+        """IO for one :meth:`draw_bank_paths` payload -- the whole prefetch payload,
+        CPU only. Loads each DISTINCT conditional bank once plus every null bank."""
+        return dict(
+            cond_u8=[self._load_images_u8(pth) for pth in drawn['cond_paths']],
+            cond_index=drawn['cond_index'],
+            null_u8=[self._load_images_u8(pth) for pth in drawn['null_paths']])
+
+    @torch.no_grad()
+    def finish_banks(self, loaded, encode_fn, feat_fn, device):
+        """GPU half for a prefetched payload -> ``(cond_banks, null_banks)``, both
+        indexed BY TRAJECTORY as ``x0_hat`` expects.
+
+        Each distinct conditional bank is encoded once and its ``(latents_cpu, feats)``
+        tuple is shared by reference across that class's rows; ``x0_hat`` only reads
+        them, so the aliasing is safe and saves the RAM as well as the IO.
+        """
+        cond_uniq = [self._finish_bank(u8, encode_fn, feat_fn, device)
+                     for u8 in loaded['cond_u8']]
+        cond_banks = [cond_uniq[i] for i in loaded['cond_index']]
+        null_banks = [self._finish_bank(u8, encode_fn, feat_fn, device)
+                      for u8 in loaded['null_u8']]
+        return cond_banks, null_banks
+
+    @torch.no_grad()
+    def build_banks(self, labels, encode_fn, feat_fn, device, null_classes=None):
+        """Synchronous build for callers that do not prefetch (the DaggerRolloutHook).
+
+        Routed through draw -> load -> finish so it gets the same per-class dedup;
+        returns ``(cond_banks, null_banks)``, each a list of ``(latents_cpu, feats)``
+        indexed by trajectory position.
 
         ``encode_fn`` maps loaded images ``[M, 3, H, W] in [0,1]`` to the diffusion
         input space (``patchify(vae.encode(img*2-1))``); ``feat_fn`` -> compact subspace.
         """
-        labels = labels.tolist() if torch.is_tensor(labels) else [int(x) for x in labels]
-        cond_banks, null_banks = [], []
-        for c in labels:
-            cond_banks.append(self._build_one(self._draw_paths(int(c)), encode_fn, feat_fn, device))
-            null_banks.append(self._build_one(self._draw_paths(-1), encode_fn, feat_fn, device))  # -1 -> null draw
-        return cond_banks, null_banks
+        drawn = self.draw_bank_paths(labels, null_classes=null_classes)
+        return self.finish_banks(
+            self.load_bank_images(drawn), encode_fn, feat_fn, device)
+
+    def _draw_paths_restricted(self, classes):
+        """null_bank_size paths drawn from the union of ``classes`` only."""
+        pool = []
+        for c in set(int(x) for x in classes):
+            if 0 <= c < self.num_classes:
+                pool.extend(self._class_paths[c])
+        if not pool:
+            return self._draw_paths(-1)
+        n = min(self.null_bank_size, len(pool)) if self.null_bank_size else len(pool)
+        idx = torch.randperm(len(pool))[:n].tolist()
+        return [pool[i] for i in idx]
 
     @torch.no_grad()
     def x0_hat(self, x_t, sigma, feat_fn, labels, cond_banks, null_banks, null_label):
@@ -206,18 +384,37 @@ class EmpiricalExpert(nn.Module):
         if not torch.is_tensor(sigma):
             sigma = torch.full((B,), float(sigma), device=device)
         sigma = sigma.to(device).reshape(B)
-        x_feat_all = feat_fn(x_t).flatten(1)  # [B, Df]
+        x_feat_all = feat_fn(x_t).flatten(1) if self.kernel_space == 'feat' else None  # [B, Df]
         labels_cpu = labels.to('cpu').long()
         out = torch.empty_like(x_t)
 
         for i in range(B):
-            lat_cpu, feat_m = (null_banks[i] if int(labels_cpu[i]) == null_label
-                               else cond_banks[i])
+            is_null = int(labels_cpu[i]) == null_label
+            lat_cpu, feat_m = null_banks[i] if is_null else cond_banks[i]
             M = feat_m.shape[0]
             sc = sigma[i].clamp_min(self.min_sigma)       # scalar
-            xf = x_feat_all[i]                            # [Df]
-            resid = xf.unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
-            d2 = resid.pow(2).sum(-1) / (2.0 * sc ** 2)   # [M]
+            if self.kernel_space == 'latent':
+                # pass 1 of 2: distances on the FULL state, streamed in chunks (the
+                # adaptive temperature needs sd over the whole bank before any
+                # weight can be formed, so this cannot fuse with the sum below).
+                M = lat_cpu.shape[0]
+                xt_i = x_t[i].float()
+                d2 = torch.empty(M, device=device)
+                for b0 in range(0, M, self.bank_chunk):
+                    b1 = min(b0 + self.bank_chunk, M)
+                    full = lat_cpu[b0:b1].to(device).float()
+                    d2[b0:b1] = (xt_i.unsqueeze(0) - (1 - sc) * full).pow(2).flatten(1).sum(-1)
+                d2 = d2 / (2.0 * sc ** 2)
+            else:
+                xf = x_feat_all[i]                            # [Df]
+                resid = xf.unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
+                d2 = resid.pow(2).sum(-1) / (2.0 * sc ** 2)   # [M]
+            if (self.temp_spread is not None and d2.numel() > 1
+                    and (is_null or not self.temp_spread_null_only)):
+                # adaptive: rescale so sd(d2) == temp_spread
+                d2 = d2 / (d2.std() / self.temp_spread).clamp_min(1.0)
+            elif is_null and self.null_temp != 1.0:
+                d2 = d2 / self.null_temp                  # unconditional branch only
             w = torch.softmax(-d2, dim=0)                 # [M]
             acc = torch.zeros(x_t.shape[1:], device=device, dtype=out.dtype)
             for b0 in range(0, M, self.bank_chunk):

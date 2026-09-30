@@ -67,6 +67,21 @@ class GaussianFlow(nn.Module):
             default_args=dict(num_timesteps=num_timesteps))
         self.flow_loss = build_module(flow_loss) if flow_loss is not None else None
 
+        # the logit-normal timestep mass can be applied EITHER by sampling
+        # (timestep_sampler.logit_normal_enable) OR as a per-point loss weight
+        # (flow_loss rescale_mode='logit_normal'), never both -- enabling both would
+        # square the density. Also check the shift matches, since the loss weight is
+        # a density in raw t and has to undo the same warp the sampler applied.
+        if isinstance(flow_loss, dict) and flow_loss.get('rescale_mode', None) == 'logit_normal':
+            assert not getattr(self.timestep_sampler, 'logit_normal_enable', False), \
+                ("flow_loss rescale_mode='logit_normal' reweights UNIFORM timesteps, so "
+                 'timestep_sampler.logit_normal_enable must be False (else the mass is '
+                 'applied twice).')
+            loss_shift = flow_loss.get('rescale_cfg', {}).get('shift', 1.0)
+            assert loss_shift == self.timestep_sampler.shift, \
+                (f"flow_loss rescale_cfg shift ({loss_shift}) must match "
+                 f'timestep_sampler.shift ({self.timestep_sampler.shift}).')
+
         default_timers.add_timer('network time')
 
     def forward_transition(

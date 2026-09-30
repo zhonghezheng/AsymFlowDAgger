@@ -77,7 +77,13 @@ class LatentDiffusionClassImageMixin:
         with torch.no_grad():
             class_labels = data['labels']
 
-            if guidance_scale != 0.0 and guidance_scale != 1.0:
+            # guidance_scale follows the CFG formula u = u_neg + w * (u_pos - u_neg):
+            #   w == 0 -> pure UNCONDITIONAL (null labels only, single forward)
+            #   w == 1 -> pure CONDITIONAL   (class labels only, single forward)
+            #   else   -> CFG (batched [neg, pos] forward, handled in forward_test)
+            if guidance_scale == 0.0:
+                class_labels = data['negative_labels']
+            elif guidance_scale != 1.0:
                 class_labels = torch.cat([data['negative_labels'], class_labels], dim=0)
 
             kwargs = dict(class_labels=class_labels)

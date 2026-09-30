@@ -25,8 +25,9 @@ export MASTER_PORT=$((10000 + RANDOM % 20000))
 export HF_HUB_OFFLINE=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export WANDB_MODE=offline
+source "$PROJ/sbatch_scripts/wandb_env.sh"
 
-NGPU=$(nvidia-smi -L | wc -l)
+NGPU=4
 CONFIG=configs/asymflow/asymflow_h_16_r8_imagenet_dagger_full_bank64_4gpus.py
 echo "host=$(hostname)  gpus=${NGPU}  config=${CONFIG}"
 
