@@ -62,6 +62,11 @@ class EmpiricalExpert(nn.Module):
         null_bank_size (int): cap for the null / unconditional bank (drawn from the
             whole dataset) -- always capped, since the unconditional posterior is
             just the global mean and loading 1.28M images would be infeasible.
+        null_bank_mode (str): ``'per_traj'`` (default) draws an independent
+            ``null_bank_size`` bank for EVERY trajectory; ``'shared'`` draws ONE
+            ``null_bank_size`` bank per bank build, shared by all of its trajectories
+            -- e.g. 20k images seen by every row instead of 2k unique per row, for
+            the IO of ~10 per-trajectory banks.
         num_workers (int): threads for the on-disk image load/decode (GIL-released).
         sample_chunk (int): rows processed at once in x0_hat (bounds memory).
         bank_chunk (int): bank entries summed at once (bounds peak memory).
@@ -75,6 +80,7 @@ class EmpiricalExpert(nn.Module):
                  num_classes=1000,
                  bank_size=256,
                  null_bank_size=512,
+                 null_bank_mode='per_traj',
                  null_temp=1.0,
                  temp_spread=None,
                  temp_spread_null_only=False,
@@ -93,6 +99,11 @@ class EmpiricalExpert(nn.Module):
         self.num_classes = num_classes
         self.bank_size = bank_size
         self.null_bank_size = null_bank_size
+        # 'shared': one null draw per build, referenced by every trajectory. Exact for
+        # x0_hat (which only reads a bank), and x0_hat streams a bank once for all the
+        # rows that share it, so a large shared bank costs one pass, not one per row.
+        assert null_bank_mode in ('per_traj', 'shared'), null_bank_mode
+        self.null_bank_mode = null_bank_mode
         # Softmax temperature for the NULL (unconditional) bank only: d2 -> d2/T
         # before the weights are taken. T=1 is the exact Bayes posterior over the
         # empirical prior -- which in 2048-d feature space saturates to a single
@@ -257,17 +268,25 @@ class EmpiricalExpert(nn.Module):
         return torch.from_numpy(image_preproc(img, self.image_size, random_flip=False))
 
     @torch.no_grad()
-    def _finish_bank(self, imgs_u8, encode_fn, feat_fn, device):
+    def _finish_bank(self, imgs_u8, encode_fn, feat_fn, device, chunk=1024):
         """GPU half of a bank: ``uint8 CPU [M,H,W,3]`` -> ``(latents_cpu bf16, feats)``.
-        include_flips adds both h-orientations (free, in-memory)."""
-        imgs = imgs_u8.to(device, non_blocking=True).permute(0, 3, 1, 2).float() / 255.0
-        if self.include_flips:
-            imgs = torch.cat([imgs, torch.flip(imgs, dims=[-1])], dim=0)
-        latents = encode_fn(imgs)                 # [M, C, H, W] diffusion input space
-        feats = feat_fn(latents).flatten(1)       # [M, Df]
-        # bf16 latents on CPU: half the RAM; x0_hat is a weighted average so the
-        # precision loss is negligible.
-        return (latents.detach().to(torch.bfloat16).cpu(), feats.detach())
+        include_flips adds both h-orientations (free, in-memory), laid out as
+        ``[originals; flips]``. Encoded ``chunk`` images at a time, so a large shared
+        null bank (20k images is ~31 GB as fp32 with flips) never sits on the GPU
+        whole; encode_fn and feat_fn act per image, so chunking changes nothing."""
+        lats, feats = [], []
+        for flipped in ((False, True) if self.include_flips else (False, )):
+            for b0 in range(0, imgs_u8.shape[0], chunk):
+                imgs = imgs_u8[b0:b0 + chunk].to(device, non_blocking=True).permute(
+                    0, 3, 1, 2).float() / 255.0
+                if flipped:
+                    imgs = torch.flip(imgs, dims=[-1])
+                latents = encode_fn(imgs)                     # [m, C, H, W] diffusion input space
+                feats.append(feat_fn(latents).flatten(1))     # [m, Df]
+                # bf16 latents on CPU: half the RAM; x0_hat is a weighted average so
+                # the precision loss is negligible.
+                lats.append(latents.detach().to(torch.bfloat16).cpu())
+        return torch.cat(lats), torch.cat(feats).detach()
 
     @torch.no_grad()
     def _build_one(self, paths, encode_fn, feat_fn, device):
@@ -294,8 +313,11 @@ class EmpiricalExpert(nn.Module):
         are genuinely different banks and dedup would change the statistics -- it is
         skipped.
 
-        The NULL draw stays INDEPENDENT per trajectory (a fresh ``null_bank_size``
-        sample for every row), so trajectories keep distinct unconditional posteriors.
+        The NULL draw is INDEPENDENT per trajectory by default (a fresh
+        ``null_bank_size`` sample for every row), so trajectories keep distinct
+        unconditional posteriors. ``null_bank_mode='shared'`` draws it ONCE and points
+        every trajectory at it (``null_index``), the same by-reference sharing as the
+        conditional dedup.
         """
         labels = labels.tolist() if torch.is_tensor(labels) else [int(x) for x in labels]
         labels = [int(c) for c in labels]
@@ -306,6 +328,7 @@ class EmpiricalExpert(nn.Module):
         else:                                          # random subsets -> no dedup
             uniq = labels
             cond_index = list(range(len(labels)))
+        n_null = 1 if self.null_bank_mode == 'shared' else len(labels)
         return dict(
             cond_paths=[self._draw_paths(c) for c in uniq],
             cond_index=cond_index,
@@ -318,31 +341,35 @@ class EmpiricalExpert(nn.Module):
             # choice can be measured rather than assumed.
             null_paths=[self._draw_paths_restricted(null_classes)
                         if null_classes is not None else self._draw_paths(-1)
-                        for _ in labels])
+                        for _ in range(n_null)],
+            null_index=[0] * len(labels) if n_null == 1 else list(range(len(labels))))
 
     @torch.no_grad()
     def load_bank_images(self, drawn):
         """IO for one :meth:`draw_bank_paths` payload -- the whole prefetch payload,
-        CPU only. Loads each DISTINCT conditional bank once plus every null bank."""
+        CPU only. Loads each DISTINCT conditional and null bank once."""
         return dict(
             cond_u8=[self._load_images_u8(pth) for pth in drawn['cond_paths']],
             cond_index=drawn['cond_index'],
-            null_u8=[self._load_images_u8(pth) for pth in drawn['null_paths']])
+            null_u8=[self._load_images_u8(pth) for pth in drawn['null_paths']],
+            null_index=drawn['null_index'])
 
     @torch.no_grad()
     def finish_banks(self, loaded, encode_fn, feat_fn, device):
         """GPU half for a prefetched payload -> ``(cond_banks, null_banks)``, both
         indexed BY TRAJECTORY as ``x0_hat`` expects.
 
-        Each distinct conditional bank is encoded once and its ``(latents_cpu, feats)``
-        tuple is shared by reference across that class's rows; ``x0_hat`` only reads
-        them, so the aliasing is safe and saves the RAM as well as the IO.
+        Each distinct bank is encoded once and its ``(latents_cpu, feats)`` tuple is
+        shared by reference across the rows that use it (a class's rows, or every row
+        under null_bank_mode='shared'); ``x0_hat`` only reads them, so the aliasing is
+        safe and saves the RAM as well as the IO.
         """
         cond_uniq = [self._finish_bank(u8, encode_fn, feat_fn, device)
                      for u8 in loaded['cond_u8']]
         cond_banks = [cond_uniq[i] for i in loaded['cond_index']]
-        null_banks = [self._finish_bank(u8, encode_fn, feat_fn, device)
-                      for u8 in loaded['null_u8']]
+        null_uniq = [self._finish_bank(u8, encode_fn, feat_fn, device)
+                     for u8 in loaded['null_u8']]
+        null_banks = [null_uniq[i] for i in loaded['null_index']]
         return cond_banks, null_banks
 
     @torch.no_grad()
@@ -396,39 +423,53 @@ class EmpiricalExpert(nn.Module):
         labels_cpu = labels.to('cpu').long()
         out = torch.empty_like(x_t)
 
+        # Rows grouped by the bank OBJECT they read, so a bank several rows share (the
+        # class dedup, null_bank_mode='shared') crosses to the GPU once per group
+        # rather than once per row. Per row the arithmetic is unchanged: the same
+        # distances, temperature, softmax and chunked weighted sum, in the same order.
+        groups = {}
         for i in range(B):
             is_null = int(labels_cpu[i]) == null_label
-            lat_cpu, feat_m = null_banks[i] if is_null else cond_banks[i]
+            bank = null_banks[i] if is_null else cond_banks[i]
+            groups.setdefault(id(bank), (bank, []))[1].append((i, is_null))
+
+        for (lat_cpu, feat_m), rows in groups.values():
             M = feat_m.shape[0]
-            sc = sigma[i].clamp_min(self.min_sigma)       # scalar
+            scs = [sigma[i].clamp_min(self.min_sigma) for i, _ in rows]   # scalars
             if self.kernel_space == 'latent':
                 # pass 1 of 2: distances on the FULL state, streamed in chunks (the
                 # adaptive temperature needs sd over the whole bank before any
                 # weight can be formed, so this cannot fuse with the sum below).
                 M = lat_cpu.shape[0]
-                xt_i = x_t[i].float()
-                d2 = torch.empty(M, device=device)
+                d2s = [torch.empty(M, device=device) for _ in rows]
                 for b0 in range(0, M, self.bank_chunk):
                     b1 = min(b0 + self.bank_chunk, M)
                     full = lat_cpu[b0:b1].to(device).float()
-                    d2[b0:b1] = (xt_i.unsqueeze(0) - (1 - sc) * full).pow(2).flatten(1).sum(-1)
-                d2 = d2 / (2.0 * sc ** 2)
+                    for (i, _), sc, d2 in zip(rows, scs, d2s):
+                        d2[b0:b1] = (x_t[i].float().unsqueeze(0) - (1 - sc) * full
+                                     ).pow(2).flatten(1).sum(-1)
+                d2s = [d2 / (2.0 * sc ** 2) for d2, sc in zip(d2s, scs)]
             else:
-                xf = x_feat_all[i]                            # [Df]
-                resid = xf.unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
-                d2 = resid.pow(2).sum(-1) / (2.0 * sc ** 2)   # [M]
-            if (self.temp_spread is not None and d2.numel() > 1
-                    and (is_null or not self.temp_spread_null_only)):
-                # adaptive: rescale so sd(d2) == temp_spread
-                d2 = d2 / (d2.std() / self.temp_spread).clamp_min(1.0)
-            elif is_null and self.null_temp != 1.0:
-                d2 = d2 / self.null_temp                  # unconditional branch only
-            w = torch.softmax(-d2, dim=0)                 # [M]
-            acc = torch.zeros(x_t.shape[1:], device=device, dtype=out.dtype)
+                d2s = []
+                for (i, _), sc in zip(rows, scs):
+                    resid = x_feat_all[i].unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
+                    d2s.append(resid.pow(2).sum(-1) / (2.0 * sc ** 2))      # [M]
+            ws = []
+            for (_, is_null), d2 in zip(rows, d2s):
+                if (self.temp_spread is not None and d2.numel() > 1
+                        and (is_null or not self.temp_spread_null_only)):
+                    # adaptive: rescale so sd(d2) == temp_spread
+                    d2 = d2 / (d2.std() / self.temp_spread).clamp_min(1.0)
+                elif is_null and self.null_temp != 1.0:
+                    d2 = d2 / self.null_temp              # unconditional branch only
+                ws.append(torch.softmax(-d2, dim=0))      # [M]
+            accs = [torch.zeros(x_t.shape[1:], device=device, dtype=out.dtype) for _ in rows]
             for b0 in range(0, M, self.bank_chunk):
                 b1 = min(b0 + self.bank_chunk, M)
                 full = lat_cpu[b0:b1].to(device).float()  # [blk, C, H, W]
-                acc += (w[b0:b1].view(-1, *([1] * (x_t.dim() - 1))) * full).sum(0)
-            out[i] = acc
+                for w, acc in zip(ws, accs):
+                    acc += (w[b0:b1].view(-1, *([1] * (x_t.dim() - 1))) * full).sum(0)
+            for (i, _), acc in zip(rows, accs):
+                out[i] = acc
 
         return out

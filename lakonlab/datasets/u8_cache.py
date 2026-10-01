@@ -44,6 +44,11 @@ class U8ImageCache:
         idx = np.load(self.prefix + '.index.npz', allow_pickle=False)
         self._row = {p: i for i, p in enumerate(idx['relpaths'].tolist())}
         self._mm = np.load(self.prefix + '.u8.npy', mmap_mode='r')
+        # once per process, so a run's log says which loader its banks/targets used
+        from lakonlab.utils import get_root_logger
+        get_root_logger().info(
+            f'u8 image cache in use: {self.prefix} ({self._mm.shape[0]:,} images, '
+            f'{self._mm.shape[1]}x{self._mm.shape[2]}; flips applied at read time)')
 
     def get(self, rel_paths, flip=None):
         """uint8 ``[M, H, W, 3]`` CPU tensor for ``rel_paths``, in the GIVEN order.

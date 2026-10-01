@@ -63,8 +63,13 @@ model = dict(diffusion=dict(
     mmd_target_share=_share,
     mmd_guidance_scale=float(_g),
     # preprocessed uint8 image cache for the target draws; bit-identical up to the
-    # (per-image, p=0.5) random flip, so NOT in the run name
-    mmd_target_u8_cache=os.environ.get('LAKON_U8_CACHE') or None,
+    # (per-image, p=0.5) random flip, so NOT in the run name. LAKON_U8_CACHE picks a
+    # prefix and '' forces the JPEG path; unset, the node-local /dev/shm cache is
+    # used whenever it is COMPLETE (log line 'u8 image cache in use').
+    mmd_target_u8_cache=(
+        os.environ['LAKON_U8_CACHE'] if 'LAKON_U8_CACHE' in os.environ
+        else '/dev/shm/asymflow/train_u8_256'
+        if os.path.exists('/dev/shm/asymflow/train_u8_256.complete') else None) or None,
 ))
 
 # LR 2.5e-4, the comparison arms' rate -- NOT the 1e-5 the base config carries. The

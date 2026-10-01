@@ -115,7 +115,13 @@ _clstag += '' if _bint == 8 else f'_i{_bint}'
 # band_traj * null_bank_size image loads every banded iteration -- 61% of the band's
 # IO. Default stays 2048 so existing runs and the f0/f50 pairing are untouched.
 _ubk = int(os.environ.get('LAKON_NULL_BANK', 2048))
-_clstag += '' if _ubk == 2048 else f'_ub{_ubk}'
+# uncond bank LAYOUT. Default: an independent _ubk-image bank per trajectory.
+# LAKON_NULL_SHARE=1: ONE _ubk-image bank per band, shared by every trajectory, so
+# LAKON_NULL_BANK is then the TOTAL (e.g. 20000 -- every row sees 20k images, for the
+# IO of ~10 per-trajectory 2048-banks). Always tagged '_ubs<size>' so a shared run can
+# never resume from a per-trajectory checkpoint.
+_nshare = os.environ.get('LAKON_NULL_SHARE', '0') != '0'
+_clstag += f'_ubs{_ubk}' if _nshare else ('' if _ubk == 2048 else f'_ub{_ubk}')
 # space the expert's posterior WEIGHTS are scored in: 'feat' (rank-8 subspace, the
 # historical default) or 'latent' (the full on-path diffusion state). Tagged only when
 # off the default, so every existing run name is unchanged.
@@ -129,17 +135,48 @@ _clstag += '' if _kspace == 'feat' else '_klat'
 # default so an 8-GPU run can never share a name with its 4-GPU counterpart.
 _spg = int(os.environ.get('LAKON_SAMPLES_PER_GPU', 256))
 _clstag += '' if _spg == 256 else f'_bs{_spg}'
+# FM micro-batch (train_cfg.grad_accum_batch_size). Unset -> no accumulation, the
+# layout every run so far used. Set it to fit a smaller card at the SAME per-GPU batch:
+# 4xH100 at the 4xH200 layout is LAKON_SAMPLES_PER_GPU=256 LAKON_GRAD_ACCUM=64. The band
+# terms run on ONE micro-batch per step and are rescaled by mmd_accum_steps to cancel
+# train_grad_accum's 1/N, so that factor is derived here, never set by hand.
+# NB band_batch / band_rows 'auto' read the MICRO-batch size, so under accumulation they
+# shrink by the same factor -- pin LAKON_BAND_BATCH / LAKON_BAND_ROWS to keep the band's
+# per-step size (round(p_high * per-GPU batch): 20 at 256 and t_split=0.92).
+_mbs = os.environ.get('LAKON_GRAD_ACCUM')
+assert not _mbs or _spg % int(_mbs) == 0, \
+    f'LAKON_GRAD_ACCUM={_mbs} must divide LAKON_SAMPLES_PER_GPU={_spg}'
+_acc = _spg // int(_mbs) if _mbs else 1
+_clstag += f'_mb{_mbs}' if _mbs else ''
+# LAKON_CFG_START=1: the point terms (CFG gap, emp_fm) also score the t=1 START state
+# of the rollout (pure noise, inference's first eval), not only the landing states
+# 0.98 .. 0.92. The gap's target there is the class-mean offset x0_u - x0_c; emp_fm's
+# loss weight there is ~1e-52. Only MMD leaves it out (identically 0). Tagged '_s1'.
+_cstart = os.environ.get('LAKON_CFG_START', '0') != '0'
+_clstag += '_s1' if _cstart else ''
 name = ('asymflow_h_16_r8_imagenet_dagger_bankfull_'
         f'{_cmtag}{_w}_f{_ftag}{_clstag}_4gpus')
+
+# uint8 image cache for the expert banks (unflipped rows; include_flips adds the
+# mirrored copies in _finish_bank, exactly as on the JPEG path). LAKON_U8_CACHE picks a
+# prefix and '' forces the JPEG path; unset, the node-local /dev/shm cache is used
+# whenever it is COMPLETE, so a run cannot silently fall back to decoding JPEGs
+# on a node that has one. The log line 'u8 image cache in use' confirms it.
+_u8_default = '/dev/shm/asymflow/train_u8_256'
+_u8 = os.environ.get('LAKON_U8_CACHE')
+if _u8 is None and os.path.exists(_u8_default + '.complete'):
+    _u8 = _u8_default
+_u8 = _u8 or None
 work_dir = f'work_dirs/{name}'
 
 model = dict(
     expert=dict(null_temp=float(_nt),
                 null_bank_size=_ubk,
+                null_bank_mode='shared' if _nshare else 'per_traj',
                 kernel_space=_kspace,
                 # preprocessed uint8 image cache (tools/build_imagenet_u8_cache.py);
-                # bit-identical banks, so deliberately NOT in the run name
-                u8_cache=os.environ.get('LAKON_U8_CACHE') or None,
+                # bit-identical banks, so deliberately NOT in the run name. See _u8.
+                u8_cache=_u8,
                 temp_spread=(float(_ts) if _ts else None),
                 temp_spread_null_only=(_tscope == 'null')),
     diffusion=dict(
@@ -188,11 +225,12 @@ model = dict(
     band_null_from_batch=bool(int(os.environ.get('LAKON_BAND_NULLBATCH', '0'))),
     band_sampler='FlowHeunODE',
     cfg_gap_max_states=int(os.environ.get('LAKON_BAND_STATES', 6)),
+    band_score_start=_cstart,
     cfg_gap_detach_uncond=False,
     mmd_interval=_bint,
     mmd_start_iter=500,       # same warmup as the DAGGER rounds
     mmd_eval_mode=True,
-    mmd_accum_steps=1,        # no grad accumulation in this arm
+    mmd_accum_steps=_acc,     # = per-GPU batch / FM micro-batch (1 unless LAKON_GRAD_ACCUM)
 ))
 
 resume_from = f'checkpoints/{name}/latest.pth'
@@ -212,3 +250,5 @@ custom_hooks = [
 ]
 
 data = dict(train_dataloader=dict(samples_per_gpu=_spg))
+if _mbs:
+    train_cfg = dict(grad_accum_batch_size=int(_mbs))

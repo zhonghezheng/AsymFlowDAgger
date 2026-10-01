@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from ..builder import MODULES
-from .gaussian_flow_mmd import GaussianFlowMMD, mmd2_rbf
+from .gaussian_flow_mmd import GaussianFlowMMD
 
 
 @MODULES.register_module()
@@ -131,6 +131,17 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             ``mmd_nfe`` / ``mmd_batch`` / ``mmd_sampler``. One band, one rollout:
             both terms read the same states, so these override the MMD names rather
             than sitting beside them.
+        band_score_start (bool): also score the point terms (CFG gap, alignment,
+            emp_fm) at the t=1 START state of the rollout (pure noise -- inference's
+            first eval), not only at the landing states. The gap has a real target
+            there: the expert's softmax is flat at t=1, so v*_c - v*_u = x0_u - x0_c,
+            the class-mean offset. Start rows are added at the same per-state share as
+            each landing state (round(band_rows / n_states)) and drawn from
+            trajectories that already get banks, so they cost no image IO. emp_fm's
+            logit-normal weight at t=1 is ~1e-52, so its start rows add ~nothing but
+            count in its per-row mean. Only MMD leaves the start out -- both of its
+            sides are exactly N(0, I) there, so the statistic is identically 0.
+            Default False.
     """
 
     def __init__(self,
@@ -157,6 +168,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                  band_class_sampling='uniform',
                  band_classes_per_batch=None,
                  band_sampler=None,
+                 band_score_start=False,
                  **kwargs):
         kwargs.setdefault('mmd_weight', 0.0)   # MMD is opt-IN here, unlike GaussianFlowMMD
         super().__init__(*args, **kwargs)
@@ -190,6 +202,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             self.mmd_batch = int(band_batch)
         if band_sampler is not None:
             self.mmd_sampler = band_sampler
+        self.band_score_start = bool(band_score_start)
         # On-path FM must STOP at the band edge whenever an on-policy term already
         # supervises the band: emp_fm regresses both branches onto the expert's v*
         # there, so leaving the FM loss full-range supervises the same sigmas twice --
@@ -483,6 +496,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                     g_sub = self.project_fn(g)
                     gap_sub = g_sub.pow(2).mean()
                     gap_comp = (g - g_sub).pow(2).mean()
+                    # per-row gap (rows have equal numel, so gap == gap_rows.mean()),
+                    # for logging the t=1 rows apart from the landing ones
+                    gap_rows = g.pow(2).flatten(1).mean(1)
             # grad-carrying cosine: the alignment term's loss is -w * cos, so
             # minimising it maximises the direction agreement.
             af, bf = a.flatten(1), b.flatten(1)
@@ -516,7 +532,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             fm_cond_frac = keep.float().mean().detach()
             emp_subfrac = emp_subfrac.detach()
         # self_sq / cross / cos are returned for LOGGING ONLY (see above).
-        return gap, fm, (fm_cond_frac, emp_subfrac), (gap_sub, gap_comp) if gap is not None else None, \
+        return gap, fm, (fm_cond_frac, emp_subfrac), \
+            (gap_sub, gap_comp, gap_rows) if gap is not None else None, \
             (None if self_sq is None else self_sq.detach()), \
             (None if cross is None else cross.detach()), cos
 
@@ -635,8 +652,16 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         n_states = self._n_band_states(x_0, t_split)
         j_pick = torch.randint(m, (n_rows, )).tolist()
         k_pick = torch.randint(n_states, (n_rows, )).tolist()
-        return dict(labels=labels, j_pick=j_pick, k_pick=k_pick,
+        plan = dict(labels=labels, j_pick=j_pick, k_pick=k_pick,
                     n_states=n_states, traj=sorted(set(j_pick)))
+        if self.band_score_start:
+            # t=1 rows for the point terms, at the share each landing state gets. Drawn
+            # from the trajectories already holding banks, so they add no IO; the
+            # trajectories are i.i.d., so this is still a uniform draw over them.
+            n_start = max(1, int(round(n_rows / max(n_states, 1))))
+            traj = plan['traj']
+            plan['j_start'] = [traj[i] for i in torch.randint(len(traj), (n_start, )).tolist()]
+        return plan
 
     def _prefetch_banks(self, plan):
         """Issue the bank IO BEFORE the flow-matching step, mirroring the MMD target
@@ -725,8 +750,14 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # states, so with MMD off the rollout is pure inference and costs no
         # activations. See the class docstring.
         ctx = contextlib.nullcontext() if use_mmd else torch.no_grad()
+        # band_score_start: the point terms also score the t=1 start state. It is split
+        # off here, so `states` stays the landing states the plan and MMD index.
+        with_start = self.band_score_start and use_point and plan.get('j_start')
         with ctx:
-            states = self._band_rollout(x_0, labels, t_split)
+            states = self._band_rollout(x_0, labels, t_split, include_start=bool(with_start))
+        start = None
+        if with_start:
+            start, states = states[0], states[1:]
 
         # ONE band state per trajectory, drawn uniformly -- so the band contributes
         # exactly m rows with the band's own t-marginal, and the point terms are an
@@ -744,12 +775,22 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 f"band rollout returned {len(states)} states but the plan was drawn "
                 f"over {plan['n_states']}; _n_band_states is out of sync with "
                 '_band_rollout.')
-            j_pick, k_pick = plan['j_pick'], plan['k_pick']
-            x_pick = torch.stack([states[k][1][j].detach()
-                                  for j, k in zip(j_pick, k_pick)])
-            sig_pick = x_0.new_tensor([states[k][0] for k in k_pick])
+            j_pick, k_pick = list(plan['j_pick']), plan['k_pick']
+            xs = [states[k][1][j].detach() for j, k in zip(j_pick, k_pick)]
+            sigs = [states[k][0] for k in k_pick]
+            land_rows = None
+            if start is not None:
+                # t=1 rows appended after the landing ones (land_rows marks the latter,
+                # for logging the two apart); every point term scores all rows
+                n_land = len(j_pick)
+                xs += [start[1][j].detach() for j in plan['j_start']]
+                sigs += [start[0]] * len(plan['j_start'])
+                j_pick += plan['j_start']
+                land_rows = torch.arange(len(j_pick), device=x_0.device) < n_land
+            x_pick = torch.stack(xs)
+            sig_pick = x_0.new_tensor(sigs)
             lab_pick = labels[torch.as_tensor(j_pick, device=labels.device)]
-            pick = (x_pick, sig_pick, lab_pick, j_pick)
+            pick = (x_pick, sig_pick, lab_pick, j_pick, land_rows)
 
         # One bank set per iteration, reused by every scored state, for the scored
         # trajectories only (plan['traj']).
@@ -757,10 +798,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         if self._needs_banks():
             banks = self._build_gap_banks(plan, encode_fn, x_0.device)
 
-        gap_sigmas, gap_vals, fm_vals, mmd_vals = [], [], [], []
+        gap_sigmas, gap_vals, fm_vals = [], [], []
         self_vals, cross_vals, cos_vals, frac_vals = [], [], [], []
-        sub_vals, comp_vals, empsub_vals = [], [], []
-        world_size, n_pooled = 1, m
+        sub_vals, comp_vals, empsub_vals, t1_vals, land_vals = [], [], [], [], []
         if pick is not None:
             # banks are indexed by position in plan['traj'], so re-index them onto the
             # drawn rows: row i scores against trajectory j_pick[i]'s banks.
@@ -776,6 +816,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 if gap is not None:
                     gap_vals.append(gap)
                     sub_vals.append(gsplit[0]); comp_vals.append(gsplit[1])
+                    if pick[4] is not None:   # the gap at t=1 vs at the landing states
+                        t1_vals.append(gsplit[2][~pick[4]].mean())
+                        land_vals.append(gsplit[2][pick[4]].mean())
                 if fm is not None:
                     fm_vals.append(fm)
                     frac_vals.append(fmdiag[0]); empsub_vals.append(fmdiag[1])
@@ -785,18 +828,17 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 if cos is not None:
                     cos_vals.append(cos)
 
-        for idx, (sigma, x_roll) in enumerate(states):
-            if use_mmd:
-                x_on = x_0 * (1.0 - sigma) + torch.randn_like(x_0) * sigma
-                f_roll, world_size = self._gather_feats(
-                    self._mmd_feats(x_roll, self.mmd_feature))
-                f_on, _ = self._gather_feats(self._mmd_feats(x_on, self.mmd_feature))
-                n_pooled = f_roll.shape[0]
-                mmd_vals.append(mmd2_rbf(
-                    f_roll, f_on,
-                    bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased))
+        mmd_loss = mmd_log_vars = None
+        if use_mmd:
+            # The target is class-matched to the BAND's labels, the ones the rollout
+            # was generated under. The micro-batch rows qualify only under
+            # band_class_sampling='batch', where the band reuses their labels; the
+            # independent 'uniform'/'prior' draws take their targets from disk by
+            # label (GaussianFlowMMD._target_per_row).
+            mmd_loss, mmd_log_vars = self._mmd_score(
+                states, x_0, labels,
+                rows_match=self.band_class_sampling == 'batch')
 
-        n_steps = max(len(states), 1)
         # *mmd_accum_steps cancels train_grad_accum's 1/N (both terms run on ONE
         # micro-batch, not all N). The extra *world_size applies to the MMD term
         # ALONE: its pooled estimate leaves each rank differentiating only its own
@@ -829,6 +871,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             log_vars['cfg_gap_sub'] = gs * acc
             log_vars['cfg_gap_comp'] = gc * acc
             log_vars['cfg_gap_subfrac'] = gs / (gs + gc).clamp_min(1e-12) * acc
+            if t1_vals:   # band_score_start: the t=1 rows' share of the gap, kept apart
+                log_vars['cfg_gap_t1'] = torch.stack(t1_vals).mean() * acc
+                log_vars['cfg_gap_land'] = torch.stack(land_vals).mean() * acc
+                log_vars['band_rows_t1'] = loss.new_tensor(float((~pick[4]).sum()) * acc)
         if cos_vals:
             cos_mean = torch.stack(cos_vals).mean()
             if self.cfg_align_weight != 0:
@@ -856,13 +902,14 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             # realised conditional fraction -- should sit at band_prob_class (0.9)
             log_vars['fm_cond_frac'] = torch.stack(frac_vals).mean() * acc
             log_vars['emp_fm_subfrac'] = torch.stack(empsub_vals).mean() * acc
-        if mmd_vals:
-            mmd = torch.stack(mmd_vals).sum() / n_steps
-            loss = loss + self.mmd_weight * mmd * acc * world_size
-            log_vars['mmd_sub' if self.mmd_feature == 'subspace' else 'mmd_raw'] = \
-                mmd.detach() * acc
-            log_vars['mmd_n'] = loss.new_tensor(float(n_pooled) * acc)
-            log_vars['loss_mmd'] = (self.mmd_weight * mmd).detach() * acc
+        if mmd_loss is not None:
+            # already carries *mmd_accum_steps and the pooled *world_size (see
+            # GaussianFlowMMD._mmd_score); its logged values are the true MMD^2
+            loss = loss + self.mmd_weight * mmd_loss
+            log_vars.update(mmd_log_vars)
+            tags = ('mmd_sub', 'mmd_raw') if self.mmd_feature == 'both' else (
+                'mmd_sub' if self.mmd_feature == 'subspace' else 'mmd_raw', )
+            log_vars['loss_mmd'] = self.mmd_weight * sum(mmd_log_vars[t] for t in tags)
         return loss, log_vars
 
     def forward_train(
@@ -875,6 +922,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             class_labels_true=None,
             expert_encode_fn=None,
             **kwargs):
+        # the MMD term's disk-drawn targets need the encoder too, and the truncated
+        # on-path branch below never reaches GaussianFlowMMD.forward_train to set it
+        if expert_encode_fn is not None:
+            self._encode_fn = expert_encode_fn
         # A replay buffer is allowed ONLY when it feeds the inherited DAGGER stream
         # while the band terms stay online. The band's own points always come from a
         # rollout taken with the CURRENT weights -- never from the buffer -- so the

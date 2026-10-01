@@ -104,10 +104,13 @@ class GaussianFlowMMD(GaussianFlowDagger):
     forward-diffusion marginals -- a distribution-level target instead of DAGGER's
     per-point expert velocity.
 
-    Class matching: the rollout reuses the minibatch rows' (dropout-applied)
-    ``class_labels`` and those same rows supply the on-path set, so the two sides
-    share an identical class mixture and the MMD cannot be driven by class-mixture
-    mismatch. By default the rollout is unguided (no CFG), matching inference in
+    Class matching: the target set always carries the ROLLOUT's labels, row for row,
+    so the two sides share an identical class mixture and the MMD cannot be driven by
+    class-mixture mismatch. When the rollout reuses the minibatch rows' (undropped)
+    labels those rows can supply the on-path set; when its labels are drawn
+    separately (``mmd_classes_per_batch``, or GaussianFlowOnPolicy's band) the targets
+    are drawn from disk by label instead (see :meth:`_target_per_row`). Both feature
+    spaces score the same target set. By default the rollout is unguided (no CFG), matching inference in
     this band (the eval ``guidance_interval`` upper edge is 0.88); set
     ``mmd_guidance_scale`` to roll the source side out from the CFG-guided sampler
     instead.
@@ -444,11 +447,13 @@ class GaussianFlowMMD(GaussianFlowDagger):
             return fn(x_t)
         return torch.utils.checkpoint.checkpoint(fn, x_t, use_reentrant=False)
 
-    def _band_rollout(self, x_ref, class_labels, t_split):
+    def _band_rollout(self, x_ref, class_labels, t_split, include_start=False):
         """Roll out from noise with the current policy for exactly the solver steps
         that stay inside the band, keeping the graph. Returns ``[(sigma, x_sigma),
         ...]`` for the states INSIDE the band (the sigma=1 start is excluded: both
         distributions are exactly N(0, I) there, so its MMD is identically 0).
+        ``include_start=True`` prepends that start as ``states[0]``, for per-point
+        terms that do have a target at t=1 (GaussianFlowOnPolicy.cfg_gap_start).
 
         The Heun scheduler is stepped exactly as in ``forward_test`` -- two network
         evals per step (predictor at sigma_k, corrector at sigma_{k+1}) -- so the
@@ -480,7 +485,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
             f'mmd_nfe={self.mmd_nfe} (first landing sigma is {float(grid[2]):.4f}).')
 
         x_t = (timesteps[0] / self.num_timesteps) * torch.randn_like(x_ref)
-        states = []
+        states = [(float(grid[0]), x_t)] if include_start else []   # pure noise, no graph
         i = 0
         for step in range(n_band):
             # above the window -> no_grad, so x_t re-enters the loop detached and the
@@ -648,37 +653,54 @@ class GaussianFlowMMD(GaussianFlowDagger):
         imgs = imgs.to(device, non_blocking=True).permute(0, 3, 1, 2).float() / 255.0
         return self._encode_fn(imgs)
 
-    def _target_feats(self, x_on, space, sigma, n_local, labels, shared=None):
-        """Features of the target (noised on-path) side.
+    def _target_per_row(self, m, rows_match):
+        """Images drawn from disk per rollout trajectory for the target side, or
+        ``None`` to use the micro-batch rows themselves.
 
-        With ``mmd_target_n`` set, the images are drawn FRESH FROM DISK for this
-        timestep (see :meth:`_draw_target_latents`) and noised with their OWN
-        independent draw -- unrelated to the rollout's initial noise, and unrelated to
-        the noise any other timestep used. Without it, falls back to the micro-batch
-        rows the rollout was built from.
+        The target must carry the ROLLOUT's labels, row for row. The micro-batch rows
+        do so only when the rollout was generated under those rows' own labels
+        (``rows_match``); a restricted (mmd_classes_per_batch) or independent (the
+        on-policy band) class draw has nothing to do with them, so its targets come
+        from disk, class-matched by label -- ``mmd_target_n`` pooled, or one per
+        trajectory without it."""
+        if self.mmd_target_n is not None:
+            ws = dist.get_world_size() if (
+                self.mmd_gather and dist.is_available() and dist.is_initialized()) else 1
+            n_local = max(1, int(self.mmd_target_n) // ws)
+            return max(1, n_local // max(m, 1))
+        return None if rows_match else 1
+
+    @torch.no_grad()
+    def _target_latents(self, x_0, sigma, labels, per_row, shared=None):
+        """The target (noised on-path) set at ``sigma``, CLASS-MATCHED to the rollout.
+
+        Built once per band state and shared by every feature space, so the trained
+        and the logged-only MMD score the same target. ``per_row=None`` uses the
+        micro-batch rows (see :meth:`_target_per_row`); otherwise ``per_row`` FRESH
+        images per label from disk (:meth:`_draw_target_latents`), or the band-wide
+        ``shared`` draw under mmd_target_share 'bank'/'both'. The noise is independent
+        of the rollout's initial noise and, unless shared, of every other timestep's.
         """
-        if n_local is None or space != self.mmd_feature:
-            return self._mmd_feats(x_on, space)
-        with torch.no_grad():
-            if shared is None:              # mmd_target_share='none'
-                per_row = max(1, n_local // max(len(labels), 1))
-                x0 = self._draw_target_latents(labels, per_row, x_on.device)
-                eps = torch.randn_like(x0)  # independent noise, drawn per timestep
-            else:                           # 'bank' / 'both': hoisted in _mmd_loss
-                x0, eps = shared
-                if eps is None:             # 'bank' -> images held, noise per step
-                    eps = torch.randn_like(x0)
-            x = x0 * (1.0 - sigma) + eps * sigma
-            return self._mmd_feats(x, space)
+        eps = None
+        if per_row is None:
+            x0 = x_0
+        elif shared is not None:            # 'bank' / 'both': hoisted in _mmd_score
+            x0, eps = shared                # eps None -> 'bank': noise per step
+        else:                               # mmd_target_share='none'
+            x0 = self._draw_target_latents(labels, per_row, x_0.device)
+        if eps is None:
+            eps = torch.randn_like(x0)
+        return x0 * (1.0 - sigma) + eps * sigma
 
     def _mmd_feats(self, x, space):
         if space == 'subspace':
             return self.feat_fn(x).flatten(1)
         return x.flatten(1)
 
-    def _mmd_loss(self, x_0, class_labels, t_split):
+    def _mmd_loss(self, x_0, class_labels, t_split, rows_match=True):
         """Per-NFE-step MMD^2 between the rollout marginal and the noised on-path
-        marginal, averaged over the band's steps."""
+        marginal, averaged over the band's steps. ``rows_match``: the rollout labels
+        are the micro-batch rows' own (see :meth:`_target_per_row`)."""
         m = min(self.mmd_batch, x_0.size(0))
         x_0 = x_0[:m].detach()
         labels = class_labels[:m]
@@ -687,46 +709,44 @@ class GaussianFlowMMD(GaussianFlowDagger):
         # around this call: they have to be in force again when the checkpoints
         # recompute during backward, which happens after this method has returned.
         states = self._band_rollout(x_0, labels, t_split)
+        return self._mmd_score(states, x_0, labels, rows_match)
 
+    def _mmd_score(self, states, x_0, labels, rows_match):
+        """MMD^2 at every band state between the rollout ``states`` (generated under
+        ``labels``) and a target set CLASS-MATCHED to those same labels; ``x_0`` holds
+        the micro-batch rows the rollout trajectories correspond to. Shared by
+        GaussianFlowOnPolicy, whose band labels are drawn independently of the batch."""
+        m = labels.numel()
         train_spaces = ('subspace', 'raw') if self.mmd_feature == 'both' \
             else (self.mmd_feature, )
         per_space = dict(subspace=[], raw=[])
         loss = x_0.new_zeros(())
         world_size, n_pooled = 1, m  # overwritten per step once the gather is known
 
-        # keep a FIFO of this rank's real-latent FEATURES so the target side can draw
-        # on more distinct images than one micro-batch holds (see mmd_target_n).
-        # Updated once per call, before the states are scored. Applies to BOTH
-        # spaces: 'raw' caches bf16 latents, 'subspace' the 2048-d features.
-        n_local = None
-        if self.mmd_target_n is not None:
-            ws = dist.get_world_size() if (
-                self.mmd_gather and dist.is_available() and dist.is_initialized()) else 1
-            n_local = max(1, int(self.mmd_target_n) // ws)
+        per_row = self._target_per_row(m, rows_match)
 
         # 'bank' / 'both': ONE draw for the whole band, taken before the loop so the
         # reused parts are identical at every step by construction rather than by the
         # draw order happening to line up.
         shared = None
-        if self.mmd_target_share != 'none' and n_local is not None:
+        if self.mmd_target_share != 'none' and per_row is not None:
             with torch.no_grad():
                 x1_s = self._draw_target_latents(
-                    [int(c) for c in labels],
-                    max(1, n_local // max(len(labels), 1)), x_0.device)
+                    [int(c) for c in labels], per_row, x_0.device)
             shared = (x1_s,
                       torch.randn_like(x1_s) if self.mmd_target_share == 'both' else None)
 
         for idx, (sigma, x_roll) in enumerate(states):
-            # forward-diffusion marginal at the SAME sigma, from the same rows
-            # (identical class mixture), fresh noise per step
-            x_on = x_0 * (1.0 - sigma) + torch.randn_like(x_0) * sigma
+            # forward-diffusion marginal at the SAME sigma, class-matched to the
+            # rollout's labels; one set per step, scored in every space
+            x_tgt = self._target_latents(x_0, sigma, labels, per_row, shared)
             for space in ('subspace', 'raw'):
                 if space in train_spaces:
                     # gather AFTER the feature map: for the subspace that is 2048-d
                     # per sample instead of the 196608-d state, and the local rows
                     # keep their graph either way.
                     f_roll, world_size = self._gather_feats(self._mmd_feats(x_roll, space))
-                    f_on, _ = self._gather_feats(self._target_feats(x_on, space, sigma, n_local, labels, shared))
+                    f_on, _ = self._gather_feats(self._mmd_feats(x_tgt, space))
                     val = mmd2_rbf(
                         f_roll, f_on,
                         bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased)
@@ -734,7 +754,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
                 else:  # not trained on -- logged only
                     with torch.no_grad():
                         f_roll, world_size = self._gather_feats(self._mmd_feats(x_roll, space))
-                        f_on, _ = self._gather_feats(self._target_feats(x_on, space, sigma, n_local, labels, shared))
+                        f_on, _ = self._gather_feats(self._mmd_feats(x_tgt, space))
                         val = mmd2_rbf(
                             f_roll, f_on,
                             bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased)
@@ -840,6 +860,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
         run_mmd = (self._mmd_claim(running_status) and t_split is not None
                    and 'class_labels' in kwargs)
         mmd_labels = None
+        rows_match = True   # rollout labels == the micro-batch rows' own labels
         if run_mmd:
             mmd_labels = class_labels_true if class_labels_true is not None \
                 else kwargs['class_labels']
@@ -848,13 +869,12 @@ class GaussianFlowMMD(GaussianFlowDagger):
                 # class set and then score a different one
                 mmd_labels = self._draw_restricted_labels(
                     min(self.mmd_batch, x_0.size(0)), x_0.device)
-        if run_mmd and self.mmd_target_n is not None:
+                rows_match = False   # the rows' images are of OTHER classes now
             m = min(self.mmd_batch, x_0.size(0))
-            ws = dist.get_world_size() if (
-                self.mmd_gather and dist.is_available() and dist.is_initialized()) else 1
-            n_local = max(1, int(self.mmd_target_n) // ws)
-            self._prefetch_targets(mmd_labels[:m], max(1, n_local // max(m, 1)),
-                                   self._n_target_draws(x_0, t_split))
+            per_row = self._target_per_row(m, rows_match)
+            if per_row is not None:   # target drawn from disk -> prefetch it
+                self._prefetch_targets(mmd_labels[:m], per_row,
+                                       self._n_target_draws(x_0, t_split))
 
         loss, log_vars = super().forward_train(
             x_0,
@@ -880,7 +900,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
             # this signature for class_labels_true); falling back to the dropped ones
             # only if it did not. Matches the CFG arms, which also roll out
             # conditional-only and apply dropout inside the loss instead.
-            mmd_loss, mmd_log_vars = self._mmd_loss(x_0, mmd_labels, t_split)
+            mmd_loss, mmd_log_vars = self._mmd_loss(
+                x_0, mmd_labels, t_split, rows_match=rows_match)
             self._drop_pending()   # nothing should remain, but never leak into the next iter
             if self.mmd_grad_probe:
                 mmd_log_vars.update(self._grad_probe(loss, mmd_loss))
