@@ -28,9 +28,15 @@ _cls = os.environ.get('LAKON_MMD_CLASSES')
 # noise per step) or 'both' (images and noise held, so the target set is a set of
 # straight-line trajectories mirroring the rollout's structure).
 _share = os.environ.get('LAKON_MMD_SHARE', 'none')
+# CFG scale of the rollout (SOURCE) side. Unset / 1 -> unguided, every arm so far.
+# E.g. 2.3 (the eval scale) rolls the band out from the guided sampler at every
+# step, so the MMD trains the guided marginal toward the data marginal. The target
+# side is unchanged. Doubles the batch of every band eval (~2x band-graph memory).
+_g = os.environ.get('LAKON_MMD_GUIDANCE', '1')
 name = 'asymflow_h_16_r8_imagenet_regft_mmd_' + _tag + _w \
     + (f'_cls{_cls}' if _cls else '') \
-    + ('' if _share == 'none' else f'_sh{_share}') + '_4gpus'
+    + ('' if _share == 'none' else f'_sh{_share}') \
+    + ('' if float(_g) == 1.0 else f'_g{_g}') + '_4gpus'
 work_dir = f'work_dirs/{name}'
 
 model = dict(diffusion=dict(
@@ -55,6 +61,10 @@ model = dict(diffusion=dict(
     mmd_classes_per_batch=(int(os.environ['LAKON_MMD_CLASSES'])
                            if os.environ.get('LAKON_MMD_CLASSES') else None),
     mmd_target_share=_share,
+    mmd_guidance_scale=float(_g),
+    # preprocessed uint8 image cache for the target draws; bit-identical up to the
+    # (per-image, p=0.5) random flip, so NOT in the run name
+    mmd_target_u8_cache=os.environ.get('LAKON_U8_CACHE') or None,
 ))
 
 # LR 2.5e-4, the comparison arms' rate -- NOT the 1e-5 the base config carries. The

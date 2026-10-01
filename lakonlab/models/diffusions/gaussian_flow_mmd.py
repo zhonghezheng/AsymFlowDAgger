@@ -8,6 +8,7 @@ import random
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -106,8 +107,10 @@ class GaussianFlowMMD(GaussianFlowDagger):
     Class matching: the rollout reuses the minibatch rows' (dropout-applied)
     ``class_labels`` and those same rows supply the on-path set, so the two sides
     share an identical class mixture and the MMD cannot be driven by class-mixture
-    mismatch. The rollout is unguided (no CFG), matching inference in this band
-    (the eval ``guidance_interval`` upper edge is 0.88).
+    mismatch. By default the rollout is unguided (no CFG), matching inference in
+    this band (the eval ``guidance_interval`` upper edge is 0.88); set
+    ``mmd_guidance_scale`` to roll the source side out from the CFG-guided sampler
+    instead.
 
     With ``expert=None`` and no ``DaggerRolloutHook`` the inherited DAGGER stream is
     inert, so the objective is exactly ``reg_ft + MMD`` (the ``regft_mmd`` arm).
@@ -125,6 +128,19 @@ class GaussianFlowMMD(GaussianFlowDagger):
             Cost is ``2 * n_band_steps`` network evals at this batch size, with
             gradient; the MMD estimator improves with batch size.
         mmd_sampler (str): scheduler name; match the eval sampler.
+        mmd_guidance_scale (float): CFG scale of the rollout (source) side. 1.0 =
+            unguided (the default). Above 1, every rollout eval is one batched
+            ``[null; cond]`` forward combined as ``forward_test`` combines it,
+            ``u = u_c + (w - 1)(u_c - u_u)``, with gradient through BOTH branches.
+            The target side is unchanged (noised real data), so the term trains
+            the GUIDED marginal toward the data marginal. Each eval runs at twice
+            the batch, so the band graph's memory roughly doubles.
+        mmd_guidance_interval (tuple | None): ``[lo, hi]`` in model-timestep units
+            (sigma, at num_timesteps=1); guidance applies only to evals with
+            ``lo <= t <= hi``, exactly as ``forward_test`` gates it. ``None`` =
+            guided at every eval, the no_grad prefix above ``mmd_t_hi`` included.
+            NB the eval interval [0, 0.88] would leave a sigma >= 0.875 band almost
+            entirely unguided.
         mmd_feature (str): ``'subspace'`` (the AsymJiT rank-``basis_rank``
             features, ``feat_fn``), ``'raw'`` (flattened latents), or ``'both'``
             (sum). The space(s) NOT trained on are still computed under no_grad
@@ -171,9 +187,12 @@ class GaussianFlowMMD(GaussianFlowDagger):
                  mmd_target_root='data/imagenet/train/',
                  mmd_target_datalist='data/imagenet/train.txt',
                  mmd_target_workers=32,
+                 mmd_target_u8_cache=None,
                  mmd_nfe=50,
                  mmd_batch=64,
                  mmd_sampler='FlowHeunODE',
+                 mmd_guidance_scale=1.0,
+                 mmd_guidance_interval=None,
                  mmd_feature='subspace',
                  mmd_bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0),
                  mmd_unbiased=True,
@@ -274,6 +293,12 @@ class GaussianFlowMMD(GaussianFlowDagger):
         self.mmd_target_root = mmd_target_root
         self.mmd_target_datalist = mmd_target_datalist
         self.mmd_target_workers = int(mmd_target_workers)
+        # optional preprocessed uint8 cache (tools/build_imagenet_u8_cache.py). The
+        # cache stores unflipped images; the random horizontal flip the JPEG path
+        # applies (image_preproc random_flip=True) is applied at read time instead,
+        # per image with p=0.5, so the target marginal is unchanged.
+        from lakonlab.datasets.u8_cache import U8ImageCache
+        self._target_u8 = U8ImageCache(mmd_target_u8_cache) if mmd_target_u8_cache else None
         self._target_paths = None      # class id -> list of relpaths (lazy, from disk)
         self._target_pool = None       # ThreadPoolExecutor for image loading
         self._prefetch_pool = None     # single orchestrator thread issuing the draws
@@ -283,6 +308,11 @@ class GaussianFlowMMD(GaussianFlowDagger):
         self.mmd_nfe = int(mmd_nfe)
         self.mmd_batch = int(mmd_batch)
         self.mmd_sampler = mmd_sampler
+        assert mmd_guidance_scale >= 1.0, (
+            f'mmd_guidance_scale must be >= 1 (1 = unguided), got {mmd_guidance_scale}')
+        self.mmd_guidance_scale = float(mmd_guidance_scale)
+        self.mmd_guidance_interval = None if mmd_guidance_interval is None \
+            else tuple(float(v) for v in mmd_guidance_interval)
         self.mmd_feature = mmd_feature
         self.mmd_bandwidths = tuple(mmd_bandwidths)
         self.mmd_unbiased = mmd_unbiased
@@ -370,8 +400,20 @@ class GaussianFlowMMD(GaussianFlowDagger):
         because dynamo does not guarantee the same traced graph, hence the same
         saved-tensor set, when it is re-entered from inside a backward pass. Only
         these band evals go eager; the bs=256 flow-matching step stays compiled.
+
+        With ``mmd_guidance_scale > 1`` the eval is the CFG-guided velocity, and the
+        guidance combination also lives inside ``fn`` so the recompute is the same
+        guided function. Whether this ``t`` is guided is decided up front from the
+        interval -- deterministic in ``t``, so forward and recompute agree.
         """
         ckpt = self.mmd_step_checkpoint and torch.is_grad_enabled()
+        w = self.mmd_guidance_scale
+        if w > 1.0 and self.mmd_guidance_interval is not None:
+            lo, hi = self.mmd_guidance_interval
+            # compared as a tensor, as forward_test does: float(t) would promote to
+            # double and can disagree with it at an edge such as sigma=0.88
+            if not (lo <= t <= hi):
+                w = 1.0
 
         def fn(x):
             net = self.denoising
@@ -383,7 +425,15 @@ class GaussianFlowMMD(GaussianFlowDagger):
             if drop_compile:
                 net._compiled_forward = None
             try:
-                return self.pred(x, t, class_labels=class_labels)
+                if w == 1.0:
+                    return self.pred(x, t, class_labels=class_labels)
+                # one batched [null; cond] eval, combined as forward_test does at the
+                # eval setting orthogonal_guidance=0 (guidance_jit reduces to this)
+                null = torch.full_like(class_labels, int(net.num_classes))
+                u_u, u_c = self.pred(
+                    torch.cat([x, x], dim=0), t,
+                    class_labels=torch.cat([null, class_labels], dim=0)).chunk(2, dim=0)
+                return u_c + (u_c - u_u) * (w - 1.0)
             finally:
                 if drop_compile:
                     net._compiled_forward = compiled
@@ -518,6 +568,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
         """One timestep's worth of target images as a uint8 CPU tensor. Touches no
         CUDA, so it can run entirely on a prefetch thread while the GPU is busy."""
         rel = self._pick_target_paths(labels, per_row)
+        if self._target_u8 is not None:
+            return self._target_u8.get(rel, flip=np.random.rand(len(rel)) < 0.5)
         return torch.stack(list(self._target_pool.map(self._load_one_target, rel)))
 
     def _draw_restricted_labels(self, m, device):

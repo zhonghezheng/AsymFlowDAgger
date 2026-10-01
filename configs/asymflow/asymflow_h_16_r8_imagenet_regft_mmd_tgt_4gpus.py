@@ -34,7 +34,12 @@ _n = os.environ.get('LAKON_MMD_TARGET_N', '2048')
 _feat = os.environ.get('LAKON_MMD_FEATURE', 'subspace')
 _tag = 'sub' if _feat == 'subspace' else _feat
 
-name = f'asymflow_h_16_r8_imagenet_regft_mmd_tgt{_n}_{_tag}{_w}_4gpus'
+# mmd_guidance_scale is inherited from the sweep config (LAKON_MMD_GUIDANCE); tagged
+# here too, or a guided run would resume from the unguided run's checkpoint
+_g = os.environ.get('LAKON_MMD_GUIDANCE', '1')
+_gtag = '' if float(_g) == 1.0 else f'_g{_g}'
+
+name = f'asymflow_h_16_r8_imagenet_regft_mmd_tgt{_n}_{_tag}{_w}{_gtag}_4gpus'
 work_dir = f'work_dirs/{name}'
 
 model = dict(diffusion=dict(

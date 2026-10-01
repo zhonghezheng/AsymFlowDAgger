@@ -84,7 +84,8 @@ class EmpiricalExpert(nn.Module):
                  sample_chunk=32,
                  bank_chunk=128,
                  min_sigma=1e-3,
-                 kernel_space='feat'):
+                 kernel_space='feat',
+                 u8_cache=None):
         super().__init__()
         self.datalist_path = datalist_path
         self.data_root = data_root
@@ -121,6 +122,11 @@ class EmpiricalExpert(nn.Module):
         #              Costs a second streamed pass over the bank latents per row.
         assert kernel_space in ('feat', 'latent'), kernel_space
         self.kernel_space = kernel_space
+        # Optional preprocessed uint8 cache prefix (tools/build_imagenet_u8_cache.py).
+        # Bit-identical to decoding the JPEGs (same image_preproc, flips applied later
+        # exactly as now), so it changes speed, not the banks. None -> JPEG path.
+        from lakonlab.datasets.u8_cache import U8ImageCache
+        self._u8 = U8ImageCache(u8_cache) if u8_cache else None
         # ADAPTIVE temperature, applied to BOTH banks: divide d2 by T so that the
         # post-scaling spread sd(d2/T) equals temp_spread. T is read off the data --
         # T = sd(d2)/temp_spread -- so it tracks sigma, bank size and feature scale
@@ -239,6 +245,8 @@ class EmpiricalExpert(nn.Module):
         # the node's training load. A loader that can hang a DDP run is worse than a
         # slower one, so the speedup is left on the table; the prefetch in
         # GaussianFlowOnPolicy._prefetch_banks hides most of this cost anyway.
+        if self._u8 is not None:        # preprocessed cache: a slice copy, no decode
+            return self._u8.get(paths)
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=self.num_workers)
         args = [(self.data_root, rp, self.image_size) for rp in paths]

@@ -137,6 +137,9 @@ model = dict(
     expert=dict(null_temp=float(_nt),
                 null_bank_size=_ubk,
                 kernel_space=_kspace,
+                # preprocessed uint8 image cache (tools/build_imagenet_u8_cache.py);
+                # bit-identical banks, so deliberately NOT in the run name
+                u8_cache=os.environ.get('LAKON_U8_CACHE') or None,
                 temp_spread=(float(_ts) if _ts else None),
                 temp_spread_null_only=(_tscope == 'null')),
     diffusion=dict(
