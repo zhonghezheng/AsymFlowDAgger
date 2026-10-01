@@ -22,8 +22,9 @@ Layout. The 4xH200 layout (256/GPU, FM micro-batch 128, mmd_batch 64) peaked at
 80 GB card. Here 128/GPU x 8 keeps the global batch at 1024; the FM runs in exact
 micro-batches of 64 (mmd_accum_steps = 128/64 = 2); mmd_batch 32 x 8 ranks keeps
 the pooled MMD at 256 trajectories, and mmd_target_n stays 2048 pooled. A guided eval
-at mmd_batch 32 costs what an unguided one did at 64. Estimated peak ~51 GB --
-extrapolated from the H200 log, not measured.
+at mmd_batch 32 costs what an unguided one did at 64. Measured peak 77.0 GB (iter
+600, after the first eval) of the card's 79.2 GiB -- tight. If it ever OOMs, halve
+the FM micro-batch to 32 with mmd_accum_steps=4 (same objective).
 
 mmd_classes_per_batch is PER RANK: 4 classes x 8 ranks, 32 trajectories each, gives
 8 trajectories per class over 32 pooled classes -- the structure of cls8 on 4 GPUs.
