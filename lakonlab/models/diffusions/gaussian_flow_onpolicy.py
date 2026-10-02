@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Hansheng Chen
 
 import contextlib
+import os
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -142,6 +144,11 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             count in its per-row mean. Only MMD leaves the start out -- both of its
             sides are exactly N(0, I) there, so the statistic is identically 0.
             Default False.
+        cfg_gap_reweight (bool): weight the CFG gap per row by the flow loss's own
+            sigma weight (0.5 * its rescale -- the pretraining logit-normal mass),
+            exactly as emp_fm and the on-path FM are, instead of a plain mean. Under
+            the logit-normal(0.8, 0.8) weight the rows at 0.98 / t=1 then carry ~0.015
+            / ~0. The unweighted value is still logged as cfg_gap_raw. Default False.
     """
 
     def __init__(self,
@@ -169,6 +176,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                  band_classes_per_batch=None,
                  band_sampler=None,
                  band_score_start=False,
+                 cfg_gap_reweight=False,
                  **kwargs):
         kwargs.setdefault('mmd_weight', 0.0)   # MMD is opt-IN here, unlike GaussianFlowMMD
         super().__init__(*args, **kwargs)
@@ -203,6 +211,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         if band_sampler is not None:
             self.mmd_sampler = band_sampler
         self.band_score_start = bool(band_score_start)
+        self.cfg_gap_reweight = bool(cfg_gap_reweight)
         # On-path FM must STOP at the band edge whenever an on-policy term already
         # supervises the band: emp_fm regresses both branches onto the expert's v*
         # there, so leaving the FM loss full-range supervises the same sigmas twice --
@@ -266,6 +275,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         self._bank_pool = None      # single orchestrator thread issuing the bank IO
         self._bank_pending = None   # in-flight bank draw for THIS iteration
         self._bank_ready = None     # (plan, future) prefetched for the NEXT band
+        self._band_t = {}           # this band's timings / bank costs, see _log_bank_cost
         self._n_states_key = None   # cache for _n_band_states
         self._n_states = None
         # How the rollout's classes are drawn. 'batch' reuses the minibatch's labels
@@ -396,17 +406,29 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # sigma arrives as the per-row vector the caller already built: with one band
         # state drawn per trajectory the rows sit at DIFFERENT sigmas, and x0_hat
         # scores each row at its own noise level.
+        t0 = self._synced_clock(x_s.device)
         with torch.no_grad():
             x0_cond = expert.x0_hat(
                 x_s, sigma, self.feat_fn, labels,
                 cond_banks, null_banks, self.null_label)
+            t1 = self._synced_clock(x_s.device)
             x0_uncond = expert.x0_hat(
                 x_s, sigma, self.feat_fn, torch.full_like(labels, self.null_label),
                 cond_banks, null_banks, self.null_label)
+        t2 = self._synced_clock(x_s.device)
+        bt = self._band_t
+        bt['band_t_x0hat_cond'] = bt.get('band_t_x0hat_cond', 0.0) + (t1 - t0)
+        bt['band_t_x0hat_null'] = bt.get('band_t_x0hat_null', 0.0) + (t2 - t1)
         # return the POSTERIOR MEANS, not velocities: the two band terms may map them
         # through different complement modes, and expert_target is pure arithmetic
         # (the bank averaging above is the expensive part, done once).
         return x0_cond.detach(), x0_uncond.detach()
+
+    def _loss_row_weights(self, t):
+        """The flow loss's per-row weight at timesteps ``t``: what it multiplies a row's
+        flat-mean squared error by (its internal 0.5, then rescale_fn). A plain per-row
+        MSE times this, averaged over rows, is exactly flow_loss's value."""
+        return self.flow_loss.rescale_fn(torch.full_like(t, 0.5), t)
 
     def _band_point_losses(self, x_s, sigma, labels, banks=None):
         """Both on-policy point terms at ONE visited state, sharing one model forward
@@ -480,8 +502,17 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             # The full CFG term, taken directly:
             #   || (v_cond - v_uncond) - (v*_cond - v*_uncond) ||^2  ==  || a - b ||^2
             # scaled by cfg_gap_weight (w_cfg) where it is added to the loss.
+            # cfg_gap_reweight: the flow loss's own per-row sigma weight (0.5 * its
+            # rescale, i.e. the pretraining logit-normal mass), so the gap is weighted
+            # along sigma exactly as emp_fm and the on-path FM are. None -> plain mean.
+            rw = self._loss_row_weights(t) if self.cfg_gap_reweight else None
+            wmean = (lambda rows: (rw * rows).mean()) if rw is not None else \
+                (lambda rows: rows.mean())
             if self.cfg_gap_weight != 0:
-                gap = (a - b).pow(2).mean()
+                if rw is not None:
+                    gap = wmean((a - b).pow(2).flatten(1).mean(1))
+                else:
+                    gap = (a - b).pow(2).mean()
                 # Diagnostic split of the gap across AsymJiT's rank-8 basis. The loss
                 # is over all 196608 dims, of which the subspace is 1.04%, so it is
                 # numerically complement-dominated -- but that is only a problem if
@@ -494,11 +525,16 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 with torch.no_grad():
                     g = a - b
                     g_sub = self.project_fn(g)
-                    gap_sub = g_sub.pow(2).mean()
-                    gap_comp = (g - g_sub).pow(2).mean()
-                    # per-row gap (rows have equal numel, so gap == gap_rows.mean()),
-                    # for logging the t=1 rows apart from the landing ones
+                    # diagnostics carry the same row weighting as the loss, so
+                    # cfg_gap == cfg_gap_sub + cfg_gap_comp still holds
+                    gap_sub = wmean(g_sub.pow(2).flatten(1).mean(1))
+                    gap_comp = wmean((g - g_sub).pow(2).flatten(1).mean(1))
+                    # per-row gap (weighted likewise, so gap == gap_rows.mean()), for
+                    # logging the t=1 rows apart from the landing ones
                     gap_rows = g.pow(2).flatten(1).mean(1)
+                    gap_raw = gap_rows.mean()                # unweighted, comparable to old runs
+                    if rw is not None:
+                        gap_rows = rw * gap_rows
             # grad-carrying cosine: the alignment term's loss is -w * cos, so
             # minimising it maximises the direction agreement.
             af, bf = a.flatten(1), b.flatten(1)
@@ -533,7 +569,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             emp_subfrac = emp_subfrac.detach()
         # self_sq / cross / cos are returned for LOGGING ONLY (see above).
         return gap, fm, (fm_cond_frac, emp_subfrac), \
-            (gap_sub, gap_comp, gap_rows) if gap is not None else None, \
+            (gap_sub, gap_comp, gap_rows, gap_raw) if gap is not None else None, \
             (None if self_sq is None else self_sq.detach()), \
             (None if cross is None else cross.detach()), cos
 
@@ -690,7 +726,28 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         drawn = expert.draw_bank_paths(
             self._plan_bank_labels(plan),
             null_classes=labels.tolist() if self.band_null_from_batch else None)
-        self._bank_pending = self._bank_pool.submit(expert.load_bank_images, drawn)
+        self._bank_pending = self._bank_pool.submit(
+            self._timed_load, expert, drawn, time.perf_counter())
+
+    @staticmethod
+    def _timed_load(expert, drawn, t_issue):
+        """``expert.load_bank_images`` stamped with when the draw was issued and how
+        long the load itself took, so consumption can tell whether the IO is hidden
+        (``band_t_load`` < ``band_t_window``) and by how much. Pure host code: safe on
+        the prefetch thread."""
+        t0 = time.perf_counter()
+        loaded = expert.load_bank_images(drawn)
+        loaded['t_issue'] = t_issue
+        loaded['t_load'] = time.perf_counter() - t0
+        return loaded
+
+    @staticmethod
+    def _synced_clock(device):
+        """``perf_counter`` once the device's queued work has finished, so the span
+        between two calls is the GPU time it covers rather than its launch time."""
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
 
     @staticmethod
     def _plan_bank_labels(plan):
@@ -725,18 +782,110 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         assert encode_fn is not None, (
             'the expert needs an encode_fn (images -> diffusion input space) to build '
             'its banks; the wrapper supplies it as expert_encode_fn. Got None.')
+        t_consume = time.perf_counter()
         if self._bank_pending is not None:
             loaded = self._bank_pending.result()      # in flight since forward_train
             self._bank_pending = None
-            return expert.finish_banks(loaded, encode_fn, self.feat_fn, device)
-        labels = plan['labels']
-        return expert.build_banks(                    # fallback: synchronous
-            self._plan_bank_labels(plan), encode_fn, self.feat_fn, device,
-            null_classes=labels.tolist() if self.band_null_from_batch else None)
+        else:                                         # fallback: synchronous, IO inline
+            labels = plan['labels']
+            drawn = expert.draw_bank_paths(
+                self._plan_bank_labels(plan),
+                null_classes=labels.tolist() if self.band_null_from_batch else None)
+            loaded = self._timed_load(expert, drawn, t_consume)
+        t_ready = time.perf_counter()
+        banks = expert.finish_banks(loaded, encode_fn, self.feat_fn, device)
+        self._log_bank_cost(loaded, banks, t_consume, t_ready,
+                            self._synced_clock(device), device)
+        return banks
+
+    def _log_bank_cost(self, loaded, banks, t_consume, t_ready, t_done, device):
+        """What this band's expert banks cost, and the largest NULL bank (images per
+        trajectory) each resource would allow at the current settings -- logged so
+        the ceiling on null_bank_size is read off a run instead of guessed.
+
+        Timings (s): ``band_t_wait`` the main thread blocked on the IO (~0 when the
+        prefetch hides it), ``band_t_load`` the IO itself on the prefetch thread,
+        ``band_t_window`` how long the IO had between issue and use, ``band_t_finish``
+        the GPU half (upload + feats). Memory (GiB, this rank): ``band_mem_gpu_bank``
+        the resident bank feats, ``band_mem_host_bank`` the banks' host copies,
+        ``band_mem_gpu_free`` device total minus the PEAK reserved so far,
+        ``band_mem_host_avail`` the node's MemAvailable.
+
+        Estimates (null images per trajectory, everything else held fixed), each
+        linear in what one more null image costs:
+          * ``null_bank_max_gpu``    -- the GPU headroom over its resident feats (both
+            orientations, every null bank) plus x0_hat's two transient [M, Df]
+            temporaries for one row. Conservative: it assumes the banks coexist with
+            the all-time peak, which they may not.
+          * ``null_bank_max_host``   -- the node's available RAM over its host copy,
+            twice (the bank in use and the next band's in flight) on every local rank.
+          * ``null_bank_max_hidden`` -- the largest bank whose load still fits the
+            prefetch window, taking load time proportional to images loaded. Above it
+            the IO stops being free and ``band_t_wait`` turns positive.
+        """
+        from .experts.empirical_expert import U8Bank
+        bt = self._band_t
+        bt['band_t_wait'] = t_ready - t_consume
+        bt['band_t_load'] = loaded['t_load']
+        bt['band_t_window'] = t_consume - loaded['t_issue']
+        bt['band_t_finish'] = t_done - t_ready
+
+        def distinct(bank_list):     # aliased (deduped / shared) banks are held once
+            return list({id(b): b for b in bank_list}.values())
+
+        def feats(b):
+            return b.feats if isinstance(b, U8Bank) else b[1]
+
+        def host_bytes(b):
+            return b.u8.nbytes if isinstance(b, U8Bank) else b[0].nbytes
+
+        gib = float(2 ** 30)
+        cond_b, null_b = distinct(banks[0]), distinct(banks[1])
+        bt['band_mem_gpu_bank'] = sum(feats(b).nbytes for b in cond_b + null_b) / gib
+        bt['band_mem_host_bank'] = sum(host_bytes(b) for b in cond_b + null_b) / gib
+        if device.type == 'cuda':
+            gpu_free = (torch.cuda.get_device_properties(device).total_memory
+                        - torch.cuda.max_memory_reserved(device))
+        else:
+            gpu_free = 0
+        host_avail = 0
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        host_avail = int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+        bt['band_mem_gpu_free'] = gpu_free / gib
+        bt['band_mem_host_avail'] = host_avail / gib
+
+        null_u8 = loaded['null_u8']
+        n_null = null_u8[0].shape[0] if null_u8 else 0   # images per null bank
+        bt['band_null_imgs'] = float(n_null)
+        if not null_b or n_null == 0:
+            return
+        # per extra null image (one more per bank, in every distinct null bank)
+        f0 = feats(null_b[0])
+        per_entry = f0[0].nbytes                          # one entry's feats, bytes
+        n_orient = f0.shape[0] // n_null
+        gpu_per_img = len(null_b) * n_orient * per_entry + 2 * n_orient * per_entry
+        host_per_img = (len(null_u8) * null_u8[0][0].nbytes * 2
+                        * int(os.environ.get('LOCAL_WORLD_SIZE', 1)))
+        bt['null_bank_max_gpu'] = n_null + gpu_free / gpu_per_img
+        bt['null_bank_max_host'] = n_null + host_avail / host_per_img
+        n_cond_imgs = sum(u.shape[0] for u in loaded['cond_u8'])
+        n_null_imgs = sum(u.shape[0] for u in null_u8)
+        if loaded['t_load'] > 0:
+            per_img_load = loaded['t_load'] / max(n_cond_imgs + n_null_imgs, 1)
+            fits = bt['band_t_window'] / per_img_load      # images loadable in the window
+            bt['null_bank_max_hidden'] = max(fits - n_cond_imgs, 0.0) / len(null_u8)
 
     def _onpolicy_loss(self, x_0, plan, t_split, encode_fn=None):
         """One shared band rollout; the CFG-gap and (optional) MMD terms on top.
         ``plan`` (from :meth:`_draw_band_plan`) fixes the classes and scored pairs."""
+        self._band_t = {}
+        t_band = self._synced_clock(x_0.device)
         labels = plan['labels']
         m = labels.numel()
         x_0 = x_0[:m].detach()
@@ -800,7 +949,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
 
         gap_sigmas, gap_vals, fm_vals = [], [], []
         self_vals, cross_vals, cos_vals, frac_vals = [], [], [], []
-        sub_vals, comp_vals, empsub_vals, t1_vals, land_vals = [], [], [], [], []
+        sub_vals, comp_vals, empsub_vals, t1_vals, land_vals, raw_vals = [], [], [], [], [], []
         if pick is not None:
             # banks are indexed by position in plan['traj'], so re-index them onto the
             # drawn rows: row i scores against trajectory j_pick[i]'s banks.
@@ -816,6 +965,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 if gap is not None:
                     gap_vals.append(gap)
                     sub_vals.append(gsplit[0]); comp_vals.append(gsplit[1])
+                    raw_vals.append(gsplit[3])
                     if pick[4] is not None:   # the gap at t=1 vs at the landing states
                         t1_vals.append(gsplit[2][~pick[4]].mean())
                         land_vals.append(gsplit[2][pick[4]].mean())
@@ -871,6 +1021,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             log_vars['cfg_gap_sub'] = gs * acc
             log_vars['cfg_gap_comp'] = gc * acc
             log_vars['cfg_gap_subfrac'] = gs / (gs + gc).clamp_min(1e-12) * acc
+            if self.cfg_gap_reweight:   # the unweighted gap, comparable to plain-mean runs
+                log_vars['cfg_gap_raw'] = torch.stack(raw_vals).mean() * acc
             if t1_vals:   # band_score_start: the t=1 rows' share of the gap, kept apart
                 log_vars['cfg_gap_t1'] = torch.stack(t1_vals).mean() * acc
                 log_vars['cfg_gap_land'] = torch.stack(land_vals).mean() * acc
@@ -910,6 +1062,11 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             tags = ('mmd_sub', 'mmd_raw') if self.mmd_feature == 'both' else (
                 'mmd_sub' if self.mmd_feature == 'subspace' else 'mmd_raw', )
             log_vars['loss_mmd'] = self.mmd_weight * sum(mmd_log_vars[t] for t in tags)
+        # the band's forward wall time (its backward runs later, fused with the FM
+        # term's) and the bank costs gathered on the way -- see _log_bank_cost
+        self._band_t['band_t_total'] = self._synced_clock(x_0.device) - t_band
+        for k, v in self._band_t.items():
+            log_vars[k] = loss.new_tensor(float(v) * acc)
         return loss, log_vars
 
     def forward_train(

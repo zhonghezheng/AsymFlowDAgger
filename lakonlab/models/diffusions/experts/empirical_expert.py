@@ -24,6 +24,44 @@ def _load_one_u8_worker(args):
     return torch.from_numpy(image_preproc(img, image_size, random_flip=False))
 
 
+class U8Bank:
+    """A bank held as its uint8 ORIGINALS plus the scoring features of every entry
+    (``bank_storage='u8'``).
+
+    ``u8`` is the loader's CPU tensor ``[N, H, W, 3]``, kept as-is; ``feats`` is
+    ``[n_orient * N, Df]`` on the device, laid out ``[originals; flips]`` exactly as
+    the bf16-latent bank's rows are. The latents themselves are NOT stored:
+    :meth:`chunks` re-derives them on the GPU with the same ops
+    :meth:`EmpiricalExpert._finish_bank` runs -- ``/255``, the h-flip in IMAGE
+    space, then ``encode_fn`` -- so every entry, flips included, is the exact fp32
+    latent rather than a bf16 rounding of it, nothing ever crosses back to the host,
+    and a streamed chunk is 1 byte per element for both orientations instead of 2
+    bytes per element per orientation.
+    """
+    __slots__ = ('u8', 'feats', 'encode_fn', 'n_orient')
+
+    def __init__(self, u8, feats, encode_fn, n_orient):
+        assert feats.shape[0] == n_orient * u8.shape[0], (feats.shape, u8.shape, n_orient)
+        self.u8 = u8
+        self.feats = feats
+        self.encode_fn = encode_fn
+        self.n_orient = n_orient
+
+    def chunks(self, device, chunk):
+        """Yield ``(lo, hi, latents)``: bank entries ``lo:hi`` as fp32 latents on
+        ``device``. Each uint8 chunk crosses to the GPU ONCE and serves every
+        orientation; ``chunk`` counts entries per transfer, across orientations."""
+        n = self.u8.shape[0]
+        step = max(1, chunk // self.n_orient)
+        for b0 in range(0, n, step):
+            b1 = min(b0 + step, n)
+            imgs = self.u8[b0:b1].to(device, non_blocking=True).permute(
+                0, 3, 1, 2).float() / 255.0
+            for o in range(self.n_orient):
+                x = torch.flip(imgs, dims=[-1]) if o else imgs
+                yield o * n + b0, o * n + b1, self.encode_fn(x).float()
+
+
 @MODULES.register_module()
 class EmpiricalExpert(nn.Module):
     """Per-class posterior-mean data oracle backed by the **dataset on disk**.
@@ -71,6 +109,14 @@ class EmpiricalExpert(nn.Module):
         sample_chunk (int): rows processed at once in x0_hat (bounds memory).
         bank_chunk (int): bank entries summed at once (bounds peak memory).
         min_sigma (float): floor on ``sigma`` in the posterior denominator.
+        bank_storage (str): how a finished bank holds its entries. ``'u8'``
+            (default) keeps the uint8 originals on the host and re-derives each
+            latent chunk on the GPU inside :meth:`x0_hat` (see :class:`U8Bank`):
+            exact, 4x fewer bytes streamed, no device->host copy at build. That
+            re-runs ``encode_fn`` per streamed chunk, which is free for the identity
+            RGBColorEncoder (an affine + reshape) but would re-run a real VAE on
+            every call -- use ``'latent'`` there: bf16 latents (both orientations)
+            encoded once at build and copied to the host.
     """
 
     def __init__(self,
@@ -91,8 +137,11 @@ class EmpiricalExpert(nn.Module):
                  bank_chunk=128,
                  min_sigma=1e-3,
                  kernel_space='feat',
-                 u8_cache=None):
+                 u8_cache=None,
+                 bank_storage='u8'):
         super().__init__()
+        assert bank_storage in ('u8', 'latent'), bank_storage
+        self.bank_storage = bank_storage
         self.datalist_path = datalist_path
         self.data_root = data_root
         self.image_size = image_size
@@ -269,24 +318,34 @@ class EmpiricalExpert(nn.Module):
 
     @torch.no_grad()
     def _finish_bank(self, imgs_u8, encode_fn, feat_fn, device, chunk=1024):
-        """GPU half of a bank: ``uint8 CPU [M,H,W,3]`` -> ``(latents_cpu bf16, feats)``.
+        """GPU half of a bank: ``uint8 CPU [M,H,W,3]`` -> a :class:`U8Bank`
+        (``bank_storage='u8'``) or a ``(latents_cpu bf16, feats)`` tuple ('latent').
         include_flips adds both h-orientations (free, in-memory), laid out as
-        ``[originals; flips]``. Encoded ``chunk`` images at a time, so a large shared
-        null bank (20k images is ~31 GB as fp32 with flips) never sits on the GPU
-        whole; encode_fn and feat_fn act per image, so chunking changes nothing."""
-        lats, feats = [], []
-        for flipped in ((False, True) if self.include_flips else (False, )):
-            for b0 in range(0, imgs_u8.shape[0], chunk):
-                imgs = imgs_u8[b0:b0 + chunk].to(device, non_blocking=True).permute(
-                    0, 3, 1, 2).float() / 255.0
-                if flipped:
-                    imgs = torch.flip(imgs, dims=[-1])
-                latents = encode_fn(imgs)                     # [m, C, H, W] diffusion input space
-                feats.append(feat_fn(latents).flatten(1))     # [m, Df]
-                # bf16 latents on CPU: half the RAM; x0_hat is a weighted average so
-                # the precision loss is negligible.
-                lats.append(latents.detach().to(torch.bfloat16).cpu())
-        return torch.cat(lats), torch.cat(feats).detach()
+        ``[originals; flips]``. ``chunk`` entries are encoded at a time, across
+        orientations -- each uint8 chunk is uploaded once and flipped on the GPU --
+        so a large shared null bank (20k images is ~31 GB as fp32 with flips) never
+        sits on the GPU whole; encode_fn and feat_fn act per image, so chunking
+        changes nothing."""
+        orients = (False, True) if self.include_flips else (False, )
+        keep_u8 = self.bank_storage == 'u8'
+        lats = [[] for _ in orients]
+        feats = [[] for _ in orients]
+        step = max(1, chunk // len(orients))
+        for b0 in range(0, imgs_u8.shape[0], step):
+            imgs = imgs_u8[b0:b0 + step].to(device, non_blocking=True).permute(
+                0, 3, 1, 2).float() / 255.0
+            for o, flipped in enumerate(orients):
+                x = torch.flip(imgs, dims=[-1]) if flipped else imgs
+                latents = encode_fn(x)                        # [m, C, H, W] diffusion input space
+                feats[o].append(feat_fn(latents).flatten(1))  # [m, Df]
+                if not keep_u8:
+                    # bf16 latents on CPU: half the RAM; x0_hat is a weighted average
+                    # so the precision loss is negligible.
+                    lats[o].append(latents.detach().to(torch.bfloat16).cpu())
+        feats = torch.cat([f for per_o in feats for f in per_o]).detach()
+        if keep_u8:
+            return U8Bank(imgs_u8, feats, encode_fn, len(orients))
+        return torch.cat([lat for per_o in lats for lat in per_o]), feats
 
     @torch.no_grad()
     def _build_one(self, paths, encode_fn, feat_fn, device):
@@ -359,8 +418,8 @@ class EmpiricalExpert(nn.Module):
         """GPU half for a prefetched payload -> ``(cond_banks, null_banks)``, both
         indexed BY TRAJECTORY as ``x0_hat`` expects.
 
-        Each distinct bank is encoded once and its ``(latents_cpu, feats)`` tuple is
-        shared by reference across the rows that use it (a class's rows, or every row
+        Each distinct bank is finished once and the result (see :meth:`_finish_bank`)
+        is shared by reference across the rows that use it (a class's rows, or every row
         under null_bank_mode='shared'); ``x0_hat`` only reads them, so the aliasing is
         safe and saves the RAM as well as the IO.
         """
@@ -377,8 +436,8 @@ class EmpiricalExpert(nn.Module):
         """Synchronous build for callers that do not prefetch (the DaggerRolloutHook).
 
         Routed through draw -> load -> finish so it gets the same per-class dedup;
-        returns ``(cond_banks, null_banks)``, each a list of ``(latents_cpu, feats)``
-        indexed by trajectory position.
+        returns ``(cond_banks, null_banks)``, each a list of banks (see
+        :meth:`_finish_bank`) indexed by trajectory position.
 
         ``encode_fn`` maps loaded images ``[M, 3, H, W] in [0,1]`` to the diffusion
         input space (``patchify(vae.encode(img*2-1))``); ``feat_fn`` -> compact subspace.
@@ -410,7 +469,9 @@ class EmpiricalExpert(nn.Module):
             sigma (float | Tensor): scalar or ``[B]`` noise levels in ``[0, 1]``.
             feat_fn (callable): ``[*, C, H, W] -> [*, Df]`` compact projection.
             labels (Tensor): ``[B]`` per-point label (null_label -> null bank).
-            cond_banks, null_banks (list): per-trajectory ``(latents_cpu, feats)``.
+            cond_banks, null_banks (list): per-trajectory banks -- :class:`U8Bank`,
+                or a ``(latents_cpu, feats)`` tuple (bank_storage='latent', or built
+                by hand as tools/bank_size_sweep.py does).
         Returns:
             Tensor: ``[B, C, H, W]`` posterior-mean data ``x0_hat``.
         """
@@ -433,20 +494,18 @@ class EmpiricalExpert(nn.Module):
             bank = null_banks[i] if is_null else cond_banks[i]
             groups.setdefault(id(bank), (bank, []))[1].append((i, is_null))
 
-        for (lat_cpu, feat_m), rows in groups.values():
+        for bank, rows in groups.values():
+            feat_m = bank.feats if isinstance(bank, U8Bank) else bank[1]
             M = feat_m.shape[0]
             scs = [sigma[i].clamp_min(self.min_sigma) for i, _ in rows]   # scalars
             if self.kernel_space == 'latent':
                 # pass 1 of 2: distances on the FULL state, streamed in chunks (the
                 # adaptive temperature needs sd over the whole bank before any
                 # weight can be formed, so this cannot fuse with the sum below).
-                M = lat_cpu.shape[0]
                 d2s = [torch.empty(M, device=device) for _ in rows]
-                for b0 in range(0, M, self.bank_chunk):
-                    b1 = min(b0 + self.bank_chunk, M)
-                    full = lat_cpu[b0:b1].to(device).float()
+                for lo, hi, full in self._bank_chunks(bank, device):
                     for (i, _), sc, d2 in zip(rows, scs, d2s):
-                        d2[b0:b1] = (x_t[i].float().unsqueeze(0) - (1 - sc) * full
+                        d2[lo:hi] = (x_t[i].float().unsqueeze(0) - (1 - sc) * full
                                      ).pow(2).flatten(1).sum(-1)
                 d2s = [d2 / (2.0 * sc ** 2) for d2, sc in zip(d2s, scs)]
             else:
@@ -464,12 +523,23 @@ class EmpiricalExpert(nn.Module):
                     d2 = d2 / self.null_temp              # unconditional branch only
                 ws.append(torch.softmax(-d2, dim=0))      # [M]
             accs = [torch.zeros(x_t.shape[1:], device=device, dtype=out.dtype) for _ in rows]
-            for b0 in range(0, M, self.bank_chunk):
-                b1 = min(b0 + self.bank_chunk, M)
-                full = lat_cpu[b0:b1].to(device).float()  # [blk, C, H, W]
+            for lo, hi, full in self._bank_chunks(bank, device):   # full: [blk, C, H, W]
                 for w, acc in zip(ws, accs):
-                    acc += (w[b0:b1].view(-1, *([1] * (x_t.dim() - 1))) * full).sum(0)
+                    acc += (w[lo:hi].view(-1, *([1] * (x_t.dim() - 1))) * full).sum(0)
             for (i, _), acc in zip(rows, accs):
                 out[i] = acc
 
         return out
+
+    def _bank_chunks(self, bank, device):
+        """Yield ``(lo, hi, latents)`` over a bank's entries, fp32 on ``device``, in
+        ``bank_chunk`` pieces -- for a :class:`U8Bank` or a legacy
+        ``(latents_cpu, feats)`` tuple alike."""
+        if isinstance(bank, U8Bank):
+            yield from bank.chunks(device, self.bank_chunk)
+            return
+        lat_cpu = bank[0]
+        M = lat_cpu.shape[0]
+        for b0 in range(0, M, self.bank_chunk):
+            b1 = min(b0 + self.bank_chunk, M)
+            yield b0, b1, lat_cpu[b0:b1].to(device).float()

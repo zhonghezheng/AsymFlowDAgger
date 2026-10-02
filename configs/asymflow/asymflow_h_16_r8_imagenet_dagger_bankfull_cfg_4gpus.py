@@ -154,6 +154,18 @@ _clstag += f'_mb{_mbs}' if _mbs else ''
 # loss weight there is ~1e-52. Only MMD leaves it out (identically 0). Tagged '_s1'.
 _cstart = os.environ.get('LAKON_CFG_START', '0') != '0'
 _clstag += '_s1' if _cstart else ''
+# LAKON_CFG_REWEIGHT=1: weight the CFG gap per row by the flow loss's own sigma weight
+# (the pretraining logit-normal mass), as emp_fm and the on-path FM are, instead of a
+# plain mean -- the 0.98 / t=1 rows then carry ~0.015 / ~0 of it. Tagged '_rw'.
+_crw = os.environ.get('LAKON_CFG_REWEIGHT', '0') != '0'
+_clstag += '_rw' if _crw else ''
+# Band lower edge: on-path FM stops there and emp_fm / the CFG gap own sigma >= it.
+# 0.92 (default, untagged) matches the DAGGER arms. 0.88 is the eval CFG cutoff
+# (guidance_interval=[0, 0.88]): the 0.88 grid state is 0.87999999 in float32, so it
+# fails the band's >= 0.88 test while inference's t <= 0.88 guides it -- the band is
+# then exactly the states inference leaves UNGUIDED, 0.90 .. 0.98. Tagged '_bt<x>'.
+_bt = float(os.environ.get('LAKON_BAND_TSPLIT', 0.92))
+_clstag += '' if _bt == 0.92 else f'_bt{_bt:g}'
 name = ('asymflow_h_16_r8_imagenet_dagger_bankfull_'
         f'{_cmtag}{_w}_f{_ftag}{_clstag}_4gpus')
 
@@ -195,7 +207,7 @@ model = dict(
     band_frac_on_path=float(_f),
     null_label=1000,
     # --- the online band: matches DAGGER's t_split so both cover the same sigmas ---
-    band_t_split=0.92,
+    band_t_split=_bt,
     band_nfe=50,
     # 'auto' -> round(p_high * batch / n_band_states): the band supplies the same
     # point budget the DAGGER carve gives sigma >= t_split. At t_split=0.92, nfe=50,
@@ -226,6 +238,7 @@ model = dict(
     band_sampler='FlowHeunODE',
     cfg_gap_max_states=int(os.environ.get('LAKON_BAND_STATES', 6)),
     band_score_start=_cstart,
+    cfg_gap_reweight=_crw,
     cfg_gap_detach_uncond=False,
     mmd_interval=_bint,
     mmd_start_iter=500,       # same warmup as the DAGGER rounds
