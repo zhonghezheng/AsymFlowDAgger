@@ -726,17 +726,23 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         drawn = expert.draw_bank_paths(
             self._plan_bank_labels(plan),
             null_classes=labels.tolist() if self.band_null_from_batch else None)
+        # the reusable (pinned) host buffer is leased HERE, on the main thread, so
+        # the prefetch thread only ever writes host memory; None -> fresh memory
+        lease = expert.lease_host_buffer(drawn)
         self._bank_pending = self._bank_pool.submit(
-            self._timed_load, expert, drawn, time.perf_counter())
+            self._timed_load, expert, drawn, time.perf_counter(), lease)
+        # whoever retires this draw releases the lease: the band that consumes it
+        # (_release_band_lease) or _drop_bank_pending if it is abandoned
+        self._bank_pending.bank_lease = lease
 
     @staticmethod
-    def _timed_load(expert, drawn, t_issue):
+    def _timed_load(expert, drawn, t_issue, lease=None):
         """``expert.load_bank_images`` stamped with when the draw was issued and how
         long the load itself took, so consumption can tell whether the IO is hidden
         (``band_t_load`` < ``band_t_window``) and by how much. Pure host code: safe on
         the prefetch thread."""
         t0 = time.perf_counter()
-        loaded = expert.load_bank_images(drawn)
+        loaded = expert.load_bank_images(drawn, lease=lease)
         loaded['t_issue'] = t_issue
         loaded['t_load'] = time.perf_counter() - t0
         return loaded
@@ -758,8 +764,23 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
     def _drop_bank_pending(self):
         """Discard an unconsumed bank draw (claimed iteration that then bailed out)."""
         if self._bank_pending is not None:
+            lease = getattr(self._bank_pending, 'bank_lease', None)
+            if lease is not None:
+                # cancel() cannot stop a load already writing the buffer, so the
+                # lease is released only once the future is DONE: at once if the
+                # cancel lands before the load starts, else when the load finishes.
+                # Until then the buffer stays busy and is never handed out again.
+                self._bank_pending.add_done_callback(
+                    lambda _f, l=lease: self._dagger_expert.release_host_buffer(l))
             self._bank_pending.cancel()
             self._bank_pending = None
+
+    def _release_band_lease(self):
+        """Release the consumed band's host buffer. Called only after the band's
+        closing device sync, when no upload can still be reading it."""
+        lease, self._band_lease = getattr(self, '_band_lease', None), None
+        if lease is not None:
+            self._dagger_expert.release_host_buffer(lease)
 
     def _build_gap_banks(self, plan, encode_fn, device):
         """One :meth:`EmpiricalExpert.build_banks` call per iteration, shared by every
@@ -793,6 +814,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 null_classes=labels.tolist() if self.band_null_from_batch else None)
             loaded = self._timed_load(expert, drawn, t_consume)
         t_ready = time.perf_counter()
+        self._band_lease = loaded.get('lease')    # released at the end of this band
         banks = expert.finish_banks(loaded, encode_fn, self.feat_fn, device)
         self._log_bank_cost(loaded, banks, t_consume, t_ready,
                             self._synced_clock(device), device)
@@ -817,13 +839,15 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             orientations, every null bank) plus x0_hat's two transient [M, Df]
             temporaries for one row. Conservative: it assumes the banks coexist with
             the all-time peak, which they may not.
-          * ``null_bank_max_host``   -- the node's available RAM over its host copy,
-            twice (the bank in use and the next band's in flight) on every local rank.
+          * ``null_bank_max_host``   -- the node's available RAM over its host copy on
+            every local rank: in the reused buffer (with its growth headroom) when
+            the expert leases one, else twice (the bank in use and the next band's,
+            allocated fresh while it is still alive).
           * ``null_bank_max_hidden`` -- the largest bank whose load still fits the
             prefetch window, taking load time proportional to images loaded. Above it
             the IO stops being free and ``band_t_wait`` turns positive.
         """
-        from .experts.empirical_expert import U8Bank
+        from .experts.empirical_expert import HostBankBuffer, U8Bank
         bt = self._band_t
         bt['band_t_wait'] = t_ready - t_consume
         bt['band_t_load'] = loaded['t_load']
@@ -859,6 +883,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             pass
         bt['band_mem_gpu_free'] = gpu_free / gib
         bt['band_mem_host_avail'] = host_avail / gib
+        bt['band_mem_host_buffers'] = self._dagger_expert.host_buffer_bytes / gib
 
         null_u8 = loaded['null_u8']
         n_null = null_u8[0].shape[0] if null_u8 else 0   # images per null bank
@@ -870,7 +895,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         per_entry = f0[0].nbytes                          # one entry's feats, bytes
         n_orient = f0.shape[0] // n_null
         gpu_per_img = len(null_b) * n_orient * per_entry + 2 * n_orient * per_entry
-        host_per_img = (len(null_u8) * null_u8[0][0].nbytes * 2
+        copies = HostBankBuffer.HEADROOM if loaded.get('lease') is not None else 2
+        host_per_img = (len(null_u8) * null_u8[0][0].nbytes * copies
                         * int(os.environ.get('LOCAL_WORLD_SIZE', 1)))
         bt['null_bank_max_gpu'] = n_null + gpu_free / gpu_per_img
         bt['null_bank_max_host'] = n_null + host_avail / host_per_img
@@ -1065,6 +1091,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # the band's forward wall time (its backward runs later, fused with the FM
         # term's) and the bank costs gathered on the way -- see _log_bank_cost
         self._band_t['band_t_total'] = self._synced_clock(x_0.device) - t_band
+        # the sync above also retired every upload that read the banks' host buffer
+        self._release_band_lease()
         for k, v in self._band_t.items():
             log_vars[k] = loss.new_tensor(float(v) * acc)
         return loss, log_vars

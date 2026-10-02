@@ -11,7 +11,9 @@ uint8 is exact, not an approximation: the diffusion input is an affine function 
 uint8/255 (``patchify(vae.encode(img * 2 - 1))`` with the identity RGBColorEncoder),
 so nothing is lost by not storing floats.
 """
+import os
 import os.path as osp
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -30,6 +32,9 @@ class U8ImageCache:
         self.prefix = prefix
         self._mm = None
         self._row = None
+        self._fd = None
+        self._pool = None
+        self._pool_key = None   # (pid, threads) the pool was made for
 
     def _open(self):
         if self._mm is not None:
@@ -44,6 +49,9 @@ class U8ImageCache:
         idx = np.load(self.prefix + '.index.npz', allow_pickle=False)
         self._row = {p: i for i, p in enumerate(idx['relpaths'].tolist())}
         self._mm = np.load(self.prefix + '.u8.npy', mmap_mode='r')
+        # a plain fd beside the memmap for read_into's pread path (offset-explicit, so
+        # one fd is safe across threads and across fork)
+        self._fd = os.open(self.prefix + '.u8.npy', os.O_RDONLY)
         # once per process, so a run's log says which loader its banks/targets used
         from lakonlab.utils import get_root_logger
         get_root_logger().info(
@@ -69,3 +77,50 @@ class U8ImageCache:
             if flip.any():
                 out[flip] = out[flip][:, :, ::-1]
         return torch.from_numpy(out)
+
+    @property
+    def image_shape(self):
+        """``(H, W, 3)`` of one cached image."""
+        self._open()
+        return tuple(self._mm.shape[1:])
+
+    def read_into(self, rel_paths, out, threads=8):
+        """Fill ``out`` -- a C-contiguous uint8 array ``[len(rel_paths), H, W, 3]``,
+        e.g. a reused (pinned) bank buffer -- with ``rel_paths``' images, in the GIVEN
+        order. Bit-identical to :meth:`get` (same file bytes, same order).
+
+        One ``pread`` per image straight into ``out`` on ``threads`` threads: the copy
+        runs in the kernel with the GIL released, so the threads are truly parallel,
+        and nothing is written twice (``get``'s gather + reorder copies every byte
+        twice on one thread). Measured with all 8 ranks of a node loading at once:
+        ~1.7 -> ~9-11 GB/s per rank at 8 threads into a reused buffer; more threads
+        stop helping there -- the node's memory bandwidth is the ceiling.
+        """
+        self._open()
+        n = len(rel_paths)
+        assert (out.dtype == np.uint8 and out.flags.c_contiguous
+                and tuple(out.shape) == (n, ) + tuple(self._mm.shape[1:])), (
+            out.dtype, out.shape, self._mm.shape)
+        rows = [self._row[p] for p in rel_paths]
+        rb = out[0].nbytes if n else 0
+        off0, fd = self._mm.offset, self._fd
+
+        def run(lo, hi):
+            for k in range(lo, hi):
+                got = os.preadv(fd, [memoryview(out[k]).cast('B')], off0 + rows[k] * rb)
+                if got != rb:
+                    raise IOError(f'short read from {self.prefix}.u8.npy: row {rows[k]} '
+                                  f'({got} of {rb} bytes)')
+
+        threads = max(1, min(int(threads), n))
+        if threads == 1:
+            run(0, n)
+            return out
+        key = (os.getpid(), threads)       # pools do not survive fork
+        if self._pool_key != key:
+            self._pool = ThreadPoolExecutor(max_workers=threads)
+            self._pool_key = key
+        bounds = np.linspace(0, n, threads + 1).astype(int)
+        # list() re-raises any worker's exception here
+        list(self._pool.map(run, bounds[:-1], bounds[1:]))
+        return out
