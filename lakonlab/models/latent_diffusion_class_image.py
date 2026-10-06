@@ -91,6 +91,26 @@ class LatentDiffusionClassImageMixin:
             if cfg.get('clamp_denoised', False):
                 kwargs['sample_callback'] = self._get_clamp_denoised_callback()
 
+            # inference-time MMD guidance (see MMDGuidance): targets are class-matched
+            # to the labels the conditional branch actually uses -- the null label
+            # under w == 0, which draws them from the whole dataset
+            mmd_guide = self._get_mmd_guide(cfg.get('mmd_guide', None))
+            if mmd_guide is not None:
+                mmd_guide.begin(
+                    data['negative_labels'] if guidance_scale == 0.0 else data['labels'],
+                    self._mmd_guide_encode)
+                kwargs['state_callback'] = mmd_guide
+
+            # inference-time empirical velocity (see EmpiricalVelocity): v*_cond over
+            # the row's whole class bank replaces the sampler's velocity above a sigma
+            emp_vel = self._get_emp_vel(cfg.get('empirical_velocity', None))
+            if emp_vel is not None:
+                assert guidance_scale != 0.0, 'empirical_velocity needs class labels'
+                assert 'sample_callback' not in kwargs, \
+                    'empirical_velocity and clamp_denoised both use sample_callback'
+                emp_vel.begin(diffusion, data['labels'], self._mmd_guide_encode)
+                kwargs['sample_callback'] = emp_vel
+
             if 'noise' in data:
                 noise = data['noise']
             else:
@@ -112,7 +132,44 @@ class LatentDiffusionClassImageMixin:
 
             out_images = (self.vae.decode(latents_out).float() / 2 + 0.5).clamp(min=0, max=1)
 
-            return dict(num_samples=bs, pred_imgs=out_images)
+            out = dict(num_samples=bs, pred_imgs=out_images)
+            if mmd_guide is not None:
+                out['log_vars'] = mmd_guide.end()
+            if emp_vel is not None:
+                out.setdefault('log_vars', dict()).update(emp_vel.end())
+            return out
+
+    def _get_emp_vel(self, ev_cfg):
+        """One EmpiricalVelocity per distinct config, built on first use and kept (the
+        datalist index is parsed once)."""
+        if not ev_cfg:
+            return None
+        from .diffusions.empirical_velocity import EmpiricalVelocity
+        cache = self.__dict__.setdefault('_emp_vels', dict())
+        key = repr(sorted(ev_cfg.items()))
+        if key not in cache:
+            cache[key] = EmpiricalVelocity(**ev_cfg)
+        return cache[key]
+
+    def _get_mmd_guide(self, mg_cfg):
+        """One MMDGuidance per distinct config, built on first use and kept, so the
+        class index and the loader threads survive across batches and eval hooks."""
+        if not mg_cfg or not (mg_cfg.get('scale', 0) or mg_cfg.get('measure_only', False)):
+            return None
+        from .diffusions.mmd_guidance import MMDGuidance
+        cache = self.__dict__.setdefault('_mmd_guides', dict())
+        key = repr(sorted(mg_cfg.items()))
+        if key not in cache:
+            cache[key] = MMDGuidance(**mg_cfg)
+        return cache[key]
+
+    def _mmd_guide_encode(self, imgs):
+        """[0, 1] images -> the diffusion input space, as the train pipeline encodes."""
+        if hasattr(self.vae, 'dtype'):
+            vae_dtype = self.vae.dtype
+        else:
+            vae_dtype = next(self.vae.parameters()).dtype
+        return self.patchify(self.vae.encode((imgs * 2 - 1).to(vae_dtype)).float())
 
 
 @MODELS.register_module()

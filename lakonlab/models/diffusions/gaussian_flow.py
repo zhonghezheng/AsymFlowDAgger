@@ -236,7 +236,12 @@ class GaussianFlow(nn.Module):
 
     def forward_test(
             self, x_0=None, noise=None, guidance_scale=1.0,
-            test_cfg_override=dict(), show_pbar=False, sample_callback=None, **kwargs):
+            test_cfg_override=dict(), show_pbar=False, sample_callback=None,
+            state_callback=None, **kwargs):
+        # state_callback(self, x_t, t) -> x_t rewrites the STATE before the network
+        # eval at every first-order solver step (for Heun, each landing state sigma_k
+        # before its predictor -- never between predictor and corrector, which would
+        # break the Heun pair). sample_callback, by contrast, runs after the eval.
         x_t = torch.randn_like(x_0) if noise is None else noise
         num_batches = x_t.size(0)
         ori_dtype = x_t.dtype
@@ -293,6 +298,8 @@ class GaussianFlow(nn.Module):
             pbar = mmcv.ProgressBar(len(timesteps))
 
         for t in timesteps:
+            if state_callback is not None and getattr(sampler, 'state_in_first_order', True):
+                x_t = state_callback(self, x_t, t)
             x_t_input = x_t
             _kwargs = kwargs
             if use_guidance:

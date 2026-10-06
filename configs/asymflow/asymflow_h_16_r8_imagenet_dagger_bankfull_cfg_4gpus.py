@@ -87,12 +87,19 @@ _nt = os.environ.get('LAKON_NULL_TEMP', '1')
 # nearest-neighbour lookup.
 _ts = os.environ.get('LAKON_TEMP_SPREAD')
 _tscope = os.environ.get('LAKON_TEMP_SCOPE', 'both')
+# LAKON_TEMP_SPREAD_NULL: a SEPARATE temp_spread for the null bank (the two banks'
+# MSE-optimal smoothing differs, see tools/vstar_cond_probe.py). LAKON_TEMP_SPREAD then
+# sets the conditional bank alone (unset -> T=1 there). Tagged '_tsc<cond>n<null>'
+# in place of '_ts<x>b'.
+_tsn = os.environ.get('LAKON_TEMP_SPREAD_NULL')
+assert not (_tsn and _tscope == 'null'), 'LAKON_TEMP_SPREAD_NULL replaces LAKON_TEMP_SCOPE=null'
 
 _ncls = os.environ.get('LAKON_BAND_NCLS')
 _nb = os.environ.get('LAKON_BAND_NULLBATCH', '0')
 _clstag = ((f'_c{_ncls}' if _ncls else '') + ('nb' if _nb != '0' else '')
            + ('' if _nt == '1' else f'_T{_nt}')
-           + ('' if not _ts else f'_ts{_ts}{"u" if _tscope == "null" else "b"}'))
+           + (f'_tsc{_ts or "T1"}n{_tsn}' if _tsn else
+              '' if not _ts else f'_ts{_ts}{"u" if _tscope == "null" else "b"}'))
 # band interval: tagged only when off the default 8, so existing run names (and their
 # resume checkpoints) are unchanged while other intervals get their own work_dir.
 # band interval. DEFAULT 1: the band fires every iteration. Interval 8 applied the
@@ -166,8 +173,54 @@ _clstag += '_rw' if _crw else ''
 # then exactly the states inference leaves UNGUIDED, 0.90 .. 0.98. Tagged '_bt<x>'.
 _bt = float(os.environ.get('LAKON_BAND_TSPLIT', 0.92))
 _clstag += '' if _bt == 0.92 else f'_bt{_bt:g}'
-name = ('asymflow_h_16_r8_imagenet_dagger_bankfull_'
-        f'{_cmtag}{_w}_f{_ftag}{_clstag}_4gpus')
+# LAKON_BAND_THI: band UPPER edge (GaussianFlowMMD mmd_t_hi). Unset -> the band runs up
+# to sigma = 1 (every earlier run). Set, the rollout above it is integrated without
+# scoring and only landing states in [LAKON_BAND_TSPLIT, LAKON_BAND_THI] are scored, e.g.
+# 0.8 / 0.9 to put the band terms on LATER times. Tagged '_th<x>'.
+_thi = os.environ.get('LAKON_BAND_THI')
+_thi = float(_thi) if _thi else None
+assert _thi is None or _thi > _bt, (_bt, _thi)
+_clstag += '' if _thi is None else f'_th{_thi:g}'
+# LAKON_EMP_FM=0: no empirical-expert FM in the band (emp_fm_weight 0), so on-path FM is
+# NOT truncated ('auto' keys on emp_fm) and covers the full sigma range as reg_ft does;
+# only the CFG-gap term (w) sits on the band. Default 1 = 'mass', every earlier run.
+# Tagged '_nofm'.
+_efm = os.environ.get('LAKON_EMP_FM', '1') != '0'
+_clstag += '' if _efm else '_nofm'
+# With emp_fm on, on-path FM is truncated at the band's LOWER edge while emp_fm scores
+# only [t_split, t_hi] -- sigma in (t_hi, 1] would get no FM, and 'mass' / band_rows
+# 'auto' would count it. Not supported: an upper edge needs emp_fm off.
+assert _thi is None or not _efm, 'LAKON_BAND_THI needs LAKON_EMP_FM=0.'
+# LAKON_BAND_1PT (DEFAULT 1 since 2026-10-03): ONE scored point per trajectory
+# (band_one_per_traj). LAKON_BAND_1PT=0 restores the old sampling, untagged. The band
+# rolls out exactly band_rows trajectories (round(p_high * batch), band_batch ignored)
+# and scores each at one uniform band state, instead of band_rows independent
+# (trajectory, state) draws with replacement over band_batch rollouts (which hit
+# ~10 of 15 trajectories at bs128, some twice). The t=1 rows of LAKON_CFG_START get
+# noise-only trajectories of their own. One bank per row: ~18 vs ~10 at bs128.
+# Tagged '_1pt' whenever on (default included), so every run name keeps saying which
+# sampling it used and the untagged names still mean the old one.
+_one = os.environ.get('LAKON_BAND_1PT', '1') != '0'
+_clstag += '_1pt' if _one else ''
+# LAKON_BAND_SOURCE=onpath -- the regft_emp arm. NO rollout: the band's rows are REAL
+# images noised to sigma >= the band edge from the training timestep sampler (reg_ft's
+# own band), and only the target changes, ε - x0 -> v*. Each row's image is left out of
+# its own conditional posterior, or v* would collapse back onto ε - x0 (see
+# GaussianFlowOnPolicy band_states). Everything else -- banks, temperature, emp_fm mass,
+# truncation -- is this config's, so it pairs with the rollout arm of the same tags.
+# Named regft_emp_* instead of dagger_bankfull_*; the default leaves every name as is.
+_bsrc = os.environ.get('LAKON_BAND_SOURCE', 'rollout')
+assert _bsrc in ('rollout', 'onpath'), _bsrc
+assert _bsrc == 'rollout' or not _cstart, 'LAKON_CFG_START needs a rollout start state'
+# LAKON_BAND_KEEP=1 (onpath only): KEEP each row's image in its class bank and write it
+# into its null bank, instead of leaving it out -- v* is then the empirical velocity of
+# a distribution containing x0. Tagged '_keep'.
+_keep = os.environ.get('LAKON_BAND_KEEP', '0') != '0'
+assert not _keep or _bsrc == 'onpath', 'LAKON_BAND_KEEP needs LAKON_BAND_SOURCE=onpath'
+_clstag += '_keep' if _keep else ''
+name = ('asymflow_h_16_r8_imagenet_'
+        + ('regft_emp_' if _bsrc == 'onpath' else 'dagger_bankfull_')
+        + f'{_cmtag}{_w}_f{_ftag}{_clstag}_4gpus')
 
 # uint8 image cache for the expert banks (unflipped rows; include_flips adds the
 # mirrored copies in _finish_bank, exactly as on the JPEG path). LAKON_U8_CACHE picks a
@@ -190,7 +243,8 @@ model = dict(
                 # bit-identical banks, so deliberately NOT in the run name. See _u8.
                 u8_cache=_u8,
                 temp_spread=(float(_ts) if _ts else None),
-                temp_spread_null_only=(_tscope == 'null')),
+                temp_spread_null_only=(_tscope == 'null'),
+                temp_spread_null=(float(_tsn) if _tsn else None)),
     diffusion=dict(
     type='GaussianFlowOnPolicy',
     # --- the online CFG term ---
@@ -199,7 +253,8 @@ model = dict(
     emp_fm_complement_mode=_fcm,
     cfg_gap_target='expert',
     cfg_align_weight=0.0,
-    emp_fm_weight='mass',     # p_high*(1-f): the band's share, minus real data's half
+    emp_fm_weight='mass' if _efm else 0.0,   # p_high*(1-f): the band's share, minus real data's half
+    mmd_t_hi=_thi,
     mmd_weight=0.0,
     allow_no_band_term=True,  # lets the w_cfg=0 control run through the same path
     onpath_truncate='auto',   # on-path FM stops at the band edge (emp_fm owns it)
@@ -238,6 +293,9 @@ model = dict(
     band_sampler='FlowHeunODE',
     cfg_gap_max_states=int(os.environ.get('LAKON_BAND_STATES', 6)),
     band_score_start=_cstart,
+    band_one_per_traj=_one,
+    band_states=_bsrc,
+    band_onpath_keep=_keep,
     cfg_gap_reweight=_crw,
     cfg_gap_detach_uncond=False,
     mmd_interval=_bint,

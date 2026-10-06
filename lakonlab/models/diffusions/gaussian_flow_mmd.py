@@ -28,7 +28,38 @@ def _pdist2(x, y):
     return (x2.unsqueeze(1) + y2.unsqueeze(0) - 2.0 * (x @ y.transpose(0, 1))).clamp_min(0)
 
 
-def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1e-12):
+@contextlib.contextmanager
+def _no_tf32():
+    """Full fp32 matmuls inside: TF32's ~1e-3 relative error on a ~2*D*sigma^2 squared
+    distance is as large as the whole pairwise SPREAD at high sigma."""
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
+def rbf_width_stats(d_yy, width, eps=1e-12, offset_mean=False):
+    """``(offset, scale)`` of the RBF arguments ``(d2 - offset) / (mult * scale)``, from
+    the target-target squared distances ``d_yy`` (diagonal = 0, excluded) over the last
+    two dims. ``'mean'``: scale = the mean pairwise d2 (the original rule), offset 0 --
+    or that mean when ``offset_mean`` (the normalised estimators, where the offset is
+    a constant factor that cancels and only keeps narrow widths from underflowing).
+    ``'spread'``: offset = that mean, scale = the STANDARD DEVIATION of the pairwise d2
+    -- see :func:`mmd2_rbf`."""
+    n = d_yy.shape[-1]
+    off = ~torch.eye(n, dtype=torch.bool, device=d_yy.device)
+    vals = d_yy[..., off]                                   # [..., n(n-1)]
+    mean = vals.mean(-1)
+    if width == 'mean':
+        return (mean if offset_mean else torch.zeros_like(mean)), mean.clamp_min(eps)
+    assert width == 'spread', width
+    return mean, vals.std(-1).clamp_min(eps)
+
+
+def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1e-12,
+             width='mean', normalize=False):
     """Multi-bandwidth RBF MMD^2 between a MODEL sample set ``fx`` (carries grad) and
     a TARGET set ``fy`` (detached).
 
@@ -56,6 +87,35 @@ def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1
     ``unbiased`` drops the diagonal from the two within-set terms (the standard
     unbiased MMD^2 estimator, which can be slightly negative when the two
     distributions coincide -- expected, and informative in the log).
+
+    ``width='spread'`` sets the widths from the SPREAD of the target pairwise
+    distances instead of their mean: k = exp(-(d2 - mean) / (mult * sd)). In raw
+    latents at sigma >= ~0.9 every d2 is ~2*D*sigma^2 to within +-0.5% (CoV ~0.003),
+    so 'mean' widths give a kernel that is constant to a few % over all pairs, and the
+    MMD degenerates to a mean-difference test. Scaling by sd keeps the kernel's
+    dynamic range across pairs the same at every sigma. The offset is a constant
+    factor exp(mean / (mult * sd)) per kernel (still a positive-definite RBF) that
+    avoids the underflow of exp(-d2 / h). It does NOT make the values O(1): with z =
+    (d2 - mean) / sd ~ N(0, 1) over target pairs, E[k] ~ exp(1 / (2 mult^2)) -- ~e^8 at
+    mult 0.25, ~1 at mult >= 1 -- so a plain average over the multipliers would be the
+    narrowest kernel alone (value and gradient). Each multiplier's term is therefore
+    divided by its own target-target mean E_yy[k] before averaging (a positive
+    constant, from the targets only): every width then contributes on the same
+    relative scale in VALUE. The GRADIENT still leans on the narrowest width (each
+    term's gradient carries 1/mult and is driven by the closest pairs: measured |grad|
+    share 0.86 / 0.11 / 0.02 / 0.004 / 0.002 over mults 0.25..4 on noised ImageNet at
+    sigma 0.9), so prefer wider multipliers, e.g. (1, 2, 4, 8, 16), with 'spread'.
+    The statistic is still heavy-tailed and its size is not
+    comparable to 'mean' (a few % norm mismatch moves pairs many sd), so an mmd_weight
+    tuned under 'mean' does not transfer. Distances are computed with TF32 off. Both
+    stats come from the targets alone, as the 'mean' rule.
+
+    ``normalize=True`` applies that per-multiplier normalisation to the 'mean' widths
+    too: each term becomes (E_xx + E_yy - 2 E_xy) / E_yy, so a mixture spanning very
+    different widths (e.g. 0.01 .. 10 x mean) is not just its widest members (whose
+    kernel values are largest). The exponent is then offset by the mean target d2 --
+    a constant factor that cancels in the ratio -- so narrow widths do not underflow.
+    'spread' always normalises. Unbiased estimator only; TF32 off.
     """
     fx = fx.float()
     fy = fy.float()
@@ -63,18 +123,35 @@ def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1
     assert m > 1 and n > 1, (
         f'MMD^2 needs at least 2 samples per side, got m={m}, n={n}. Raise '
         f'mmd_batch or mmd_target_n.')
-    d_xx = _pdist2(fx, fx)
-    d_yy = _pdist2(fy, fy)
-    d_xy = _pdist2(fx, fy)
+    stable = width == 'spread' or normalize     # offset + masked diagonal + per-mult ratio
+    with (_no_tf32() if stable else contextlib.nullcontext()):
+        d_xx = _pdist2(fx, fx)
+        d_yy = _pdist2(fy, fy)
+        d_xy = _pdist2(fx, fy)
+    # under 'spread' a self-pair (d2 = 0) has k = exp(mean / (mult * sd)) -- e^~1000 at
+    # high sigma, clamped to e^60 -- so the diagonal must be MASKED, not subtracted
+    # after summing (that cancellation wipes out the off-diagonal terms), and the
+    # biased estimator, which keeps those self-pairs, is meaningless.
+    assert not stable or unbiased, "width='spread' / normalize need the unbiased estimator."
     with torch.no_grad():
-        base = (d_yy.detach().sum() / (n * (n - 1))).clamp_min(eps)
+        offset, scale = rbf_width_stats(d_yy.detach(), width, eps, offset_mean=stable)
+        if stable:
+            eye_x = torch.eye(m, dtype=torch.bool, device=fx.device)
+            eye_y = torch.eye(n, dtype=torch.bool, device=fy.device)
     total = 0.0
     for mult in bandwidths:
-        denom = base * mult
-        k_xx = torch.exp(-d_xx / denom)
-        k_yy = torch.exp(-d_yy / denom)
-        k_xy = torch.exp(-d_xy / denom)
-        if unbiased:
+        denom = scale * mult
+        # clamp: a pair 60+ widths CLOSER than the typical one would overflow fp32
+        k_xx = torch.exp(-((d_xx - offset) / denom).clamp_min(-60.0))
+        k_yy = torch.exp(-((d_yy - offset) / denom).clamp_min(-60.0))
+        k_xy = torch.exp(-((d_xy - offset) / denom).clamp_min(-60.0))
+        if stable:
+            e_xx = k_xx.masked_fill(eye_x, 0.0).sum() / (m * (m - 1))
+            e_yy = k_yy.masked_fill(eye_y, 0.0).sum() / (n * (n - 1))
+            # per-multiplier normalisation by the (constant) target-target mean
+            total = total + (e_xx + e_yy - 2.0 * k_xy.mean()) / e_yy.detach().clamp_min(eps)
+            continue
+        elif unbiased:
             e_xx = (k_xx.sum() - k_xx.diagonal().sum()) / (m * (m - 1))
             e_yy = (k_yy.sum() - k_yy.diagonal().sum()) / (n * (n - 1))
         else:
@@ -82,6 +159,57 @@ def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1
             e_yy = k_yy.mean()
         total = total + e_xx + e_yy - 2.0 * k_xy.mean()
     return total / len(bandwidths)
+
+
+def _offdiag_dist(d, eps, beta=1.0):
+    """||.||^beta from squared distances, with the diagonal (self-pairs) set to 0 and
+    cut out of the graph BEFORE the power: d_ii is 0 only up to rounding, and
+    d(d^(beta/2))/dd is unbounded there for beta < 2, so a leaked diagonal gradient is
+    not negligible."""
+    eye = torch.eye(d.shape[0], dtype=torch.bool, device=d.device)
+    return d.masked_fill(eye, 1.0).clamp_min(eps).pow(0.5 * beta).masked_fill(eye, 0.0)
+
+
+def mmd2_energy(fx, fy, unbiased=True, eps=1e-12, beta=1.0):
+    """Energy-distance MMD^2 between a MODEL sample set ``fx`` (carries grad) and a
+    TARGET set ``fy`` (detached):
+
+        E = 2 E||x - y|| - E||x - x'|| - E||y - y'||
+
+    i.e. MMD^2 under the distance-induced kernel k(a, b) = -||a - b|| (Szekely & Rizzo;
+    Sejdinovic et al. 2013). Characteristic, with NO bandwidth: nothing to tune and no
+    exp to saturate -- the per-pair gradient (x - y) / ||x - y|| is a unit vector
+    whatever the distance. ``unbiased`` (default) is the U-statistic (self-pairs out
+    of both within-set means; can be slightly negative when P == Q); otherwise the
+    V-statistic (self-pairs contribute 0 to an m^2 mean). Distances are computed with
+    TF32 off: the statistic is a small difference of ~sqrt(2 D sigma^2)-sized means.
+
+    ``beta`` in (0, 2) is the distance exponent, k(a, b) = -||a - b||^beta (the
+    generalised energy distance, characteristic for 0 < beta < 2): small beta weighs
+    LOCAL differences more, beta -> 2 tends to mean-matching (||mu_x - mu_y||^2). The
+    per-pair gradient is beta ||x - y||^(beta - 2) (x - y).
+    """
+    assert 0.0 < beta < 2.0, f'energy beta must be in (0, 2), got {beta}'
+    fx = fx.float()
+    fy = fy.float()
+    m, n = fx.shape[0], fy.shape[0]
+    assert m > 1 and n > 1, (
+        f'MMD^2 needs at least 2 samples per side, got m={m}, n={n}.')
+    with _no_tf32():
+        d_xx = _pdist2(fx, fx)
+        d_yy = _pdist2(fy, fy)
+        d_xy = _pdist2(fx, fy)
+    r_xx = _offdiag_dist(d_xx, eps, beta)
+    with torch.no_grad():
+        r_yy = _offdiag_dist(d_yy, eps, beta)
+    r_xy = d_xy.clamp_min(eps).pow(0.5 * beta)
+    if unbiased:
+        e_xx = r_xx.sum() / (m * (m - 1))
+        e_yy = r_yy.sum() / (n * (n - 1))
+    else:
+        e_xx = r_xx.sum() / (m * m)
+        e_yy = r_yy.sum() / (n * n)
+    return 2.0 * r_xy.mean() - e_xx - e_yy
 
 
 @MODULES.register_module()
@@ -149,6 +277,9 @@ class GaussianFlowMMD(GaussianFlowDagger):
             (sum). The space(s) NOT trained on are still computed under no_grad
             and logged, so both are always visible.
         mmd_bandwidths (tuple): RBF bandwidth multipliers on the median heuristic.
+        mmd_width (str): what the multipliers scale -- ``'mean'`` (the mean target
+            pairwise squared distance, default) or ``'spread'`` (its standard
+            deviation; see :func:`mmd2_rbf`).
         mmd_unbiased (bool): unbiased (diagonal-free) MMD^2 estimator.
         mmd_interval (int): compute the term every N iterations (1 = every step).
         mmd_start_iter (int): no MMD before this iteration (LR/optimizer warmup on
@@ -198,6 +329,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
                  mmd_guidance_interval=None,
                  mmd_feature='subspace',
                  mmd_bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0),
+                 mmd_width='mean',
                  mmd_unbiased=True,
                  mmd_interval=1,
                  mmd_start_iter=0,
@@ -318,6 +450,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
             else tuple(float(v) for v in mmd_guidance_interval)
         self.mmd_feature = mmd_feature
         self.mmd_bandwidths = tuple(mmd_bandwidths)
+        assert mmd_width in ('mean', 'spread'), mmd_width
+        self.mmd_width = mmd_width
         self.mmd_unbiased = mmd_unbiased
         self.mmd_interval = int(mmd_interval)
         self.mmd_start_iter = int(mmd_start_iter)
@@ -749,7 +883,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
                     f_on, _ = self._gather_feats(self._mmd_feats(x_tgt, space))
                     val = mmd2_rbf(
                         f_roll, f_on,
-                        bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased)
+                        bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased,
+                        width=self.mmd_width)
                     loss = loss + val
                 else:  # not trained on -- logged only
                     with torch.no_grad():
@@ -757,7 +892,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
                         f_on, _ = self._gather_feats(self._mmd_feats(x_tgt, space))
                         val = mmd2_rbf(
                             f_roll, f_on,
-                            bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased)
+                            bandwidths=self.mmd_bandwidths, unbiased=self.mmd_unbiased,
+                            width=self.mmd_width)
                 n_pooled = f_roll.shape[0]
                 per_space[space].append(val.detach())
 

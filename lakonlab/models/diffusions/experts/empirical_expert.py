@@ -68,6 +68,23 @@ class U8Bank:
                 x = torch.flip(imgs, dims=[-1]) if o else imgs
                 yield o * n + b0, o * n + b1, self.encode_fn(x).float()
 
+    def entry(self, k, device):
+        """Bank entry ``k`` (index into the ``[originals; flips]`` layout) as an fp32
+        latent ``[C, H, W]``, derived with exactly the ops :meth:`chunks` uses."""
+        if self.lease is not None:
+            self.lease[0].check(self.lease[1])
+        n = self.u8.shape[0]
+        o, j = divmod(int(k), n)
+        img = self.u8[j:j + 1].to(device).permute(0, 3, 1, 2).float() / 255.0
+        x = torch.flip(img, dims=[-1]) if o else img
+        return self.encode_fn(x).float()[0]
+
+    def orientations(self, k):
+        """Every entry index holding the same IMAGE as entry ``k`` (it and its flip)."""
+        n = self.u8.shape[0]
+        j = int(k) % n
+        return [o * n + j for o in range(self.n_orient)]
+
 
 class HostBankBuffer:
     """One reusable host buffer holding a whole band's banks (uint8 images), pinned
@@ -221,6 +238,7 @@ class EmpiricalExpert(nn.Module):
                  null_temp=1.0,
                  temp_spread=None,
                  temp_spread_null_only=False,
+                 temp_spread_null=None,
                  random_flip=True,
                  include_flips=False,
                  num_workers=32,
@@ -308,6 +326,12 @@ class EmpiricalExpert(nn.Module):
         # exact (saturated) posterior. Isolates "smooth the unconditional branch"
         # from "smooth both".
         self.temp_spread_null_only = bool(temp_spread_null_only)
+        # A SEPARATE temp_spread for the null bank (None -> temp_spread, as before).
+        # The two banks' MSE-optimal smoothing differs: a 1300-image class bank and a
+        # 10k all-class bank saturate differently, and measured (held-out images,
+        # tools/vstar_cond_probe.py) the null optimum sits at a lower temperature
+        # (larger spread) than the conditional one.
+        self.temp_spread_null = None if temp_spread_null is None else float(temp_spread_null)
         self.random_flip = random_flip   # match the training augmentation (h-flip p=0.5)
         self.include_flips = include_flips  # add BOTH h-orientations of every image to the bank
         self.num_workers = num_workers
@@ -612,7 +636,8 @@ class EmpiricalExpert(nn.Module):
         return [pool[i] for i in idx]
 
     @torch.no_grad()
-    def x0_hat(self, x_t, sigma, feat_fn, labels, cond_banks, null_banks, null_label):
+    def x0_hat(self, x_t, sigma, feat_fn, labels, cond_banks, null_banks, null_label,
+               exclude=None):
         """Posterior-mean data estimate, each row over its OWN trajectory bank:
         row ``i`` uses ``cond_banks[i]`` if ``labels[i] != null_label`` else
         ``null_banks[i]`` (both from :meth:`build_banks`, indexed by position).
@@ -625,6 +650,9 @@ class EmpiricalExpert(nn.Module):
             cond_banks, null_banks (list): per-trajectory banks -- :class:`U8Bank`,
                 or a ``(latents_cpu, feats)`` tuple (bank_storage='latent', or built
                 by hand as tools/bank_size_sweep.py does).
+            exclude (list | None): per row, ``None`` or the indices of entries of the
+                bank THAT ROW READS to leave out of its posterior (weight 0) -- e.g.
+                both orientations of the image an on-path state was noised from.
         Returns:
             Tensor: ``[B, C, H, W]`` posterior-mean data ``x0_hat``.
         """
@@ -667,11 +695,22 @@ class EmpiricalExpert(nn.Module):
                     resid = x_feat_all[i].unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
                     d2s.append(resid.pow(2).sum(-1) / (2.0 * sc ** 2))      # [M]
             ws = []
-            for (_, is_null), d2 in zip(rows, d2s):
-                if (self.temp_spread is not None and d2.numel() > 1
+            for (i, is_null), d2 in zip(rows, d2s):
+                ex = None if exclude is None else exclude[i]
+                kept = d2
+                if ex is not None:
+                    # leave-one-out: the dropped entries get weight exactly 0, and the
+                    # adaptive temperature is read off the KEPT entries only
+                    keep = torch.ones(M, dtype=torch.bool, device=device)
+                    keep[torch.as_tensor(ex, device=device)] = False
+                    kept = d2[keep]
+                    d2 = d2.masked_fill(~keep, float('inf'))
+                ts = self.temp_spread_null if (is_null and self.temp_spread_null is not None) \
+                    else self.temp_spread
+                if (ts is not None and kept.numel() > 1
                         and (is_null or not self.temp_spread_null_only)):
                     # adaptive: rescale so sd(d2) == temp_spread
-                    d2 = d2 / (d2.std() / self.temp_spread).clamp_min(1.0)
+                    d2 = d2 / (kept.std() / ts).clamp_min(1.0)
                 elif is_null and self.null_temp != 1.0:
                     d2 = d2 / self.null_temp              # unconditional branch only
                 ws.append(torch.softmax(-d2, dim=0))      # [M]

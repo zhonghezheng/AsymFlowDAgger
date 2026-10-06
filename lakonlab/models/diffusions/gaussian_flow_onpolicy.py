@@ -144,6 +144,34 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             count in its per-row mean. Only MMD leaves the start out -- both of its
             sides are exactly N(0, I) there, so the statistic is identically 0.
             Default False.
+        band_one_per_traj (bool): ONE scored point per trajectory. The rollout width
+            becomes the row count (``band_rows``; ``band_batch`` is ignored) and each
+            trajectory is scored at one band state drawn uniformly, so no two rows
+            share a trajectory and no rollout goes unscored. The t=1 rows of
+            ``band_score_start`` then sit on trajectories of their OWN -- fresh noise,
+            which needs no rollout since the start is their only scored state -- at
+            the cost of one bank per row (``band_rows`` + start rows) instead of the
+            ~0.65 * band_batch distinct trajectories the independent draw hits.
+            Default True; False restores independent (trajectory, state) draws with
+            replacement over ``band_batch`` rollouts.
+        band_states (str): where the band's scored states come from. ``'rollout'``
+            (default) -- the current policy's Heun rollout, as described above.
+            ``'onpath'`` -- NO rollout: each row is a real image noised to a
+            sigma drawn from the training timestep sampler restricted to
+            sigma >= the band edge, ``x_t = (1 - s) x0 + s eps``. That is reg_ft's
+            band exactly, with the true velocity swapped for v* (the regft_emp arm).
+            The image is a uniform entry of the row's own class bank (a uniform
+            image of its class, either orientation -- the dataloader's distribution
+            under 'prior' class sampling), and BOTH orientations of it are left out
+            of that row's conditional posterior. Without that the posterior at
+            sigma >= 0.88 collapses onto x0 itself and v* reduces to eps - x0, i.e.
+            to reg_ft. Needs band_one_per_traj and the u8 bank storage; MMD and
+            band_score_start have no meaning without a rollout and are refused.
+        band_onpath_keep (bool): ``'onpath'`` only -- KEEP each row's image in its
+            posteriors instead of leaving it out: no exclusion in the class bank, and
+            the image is written into the row's null bank too. v* is then the
+            empirical velocity of a distribution that contains x0 (at T=1 and
+            sigma <~ 0.94 it is eps - x0 to within float error). Default False.
         cfg_gap_reweight (bool): weight the CFG gap per row by the flow loss's own
             sigma weight (0.5 * its rescale -- the pretraining logit-normal mass),
             exactly as emp_fm and the on-path FM are, instead of a plain mean. Under
@@ -176,6 +204,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                  band_classes_per_batch=None,
                  band_sampler=None,
                  band_score_start=False,
+                 band_one_per_traj=True,
+                 band_states='rollout',
+                 band_onpath_keep=False,
                  cfg_gap_reweight=False,
                  **kwargs):
         kwargs.setdefault('mmd_weight', 0.0)   # MMD is opt-IN here, unlike GaussianFlowMMD
@@ -211,6 +242,18 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         if band_sampler is not None:
             self.mmd_sampler = band_sampler
         self.band_score_start = bool(band_score_start)
+        self.band_one_per_traj = bool(band_one_per_traj)
+        assert band_states in ('rollout', 'onpath'), band_states
+        self.band_states = band_states
+        assert not band_onpath_keep or band_states == 'onpath', \
+            "band_onpath_keep only applies to band_states='onpath'."
+        self.band_onpath_keep = bool(band_onpath_keep)
+        if band_states == 'onpath':
+            assert self.band_one_per_traj, \
+                "band_states='onpath' needs band_one_per_traj (one bank per row)."
+            assert self.mmd_weight == 0 and not self.band_score_start, (
+                "band_states='onpath' has no rollout: MMD and band_score_start (the "
+                'rollout start state) do not apply.')
         self.cfg_gap_reweight = bool(cfg_gap_reweight)
         # On-path FM must STOP at the band edge whenever an on-policy term already
         # supervises the band: emp_fm regresses both branches onto the expert's v*
@@ -311,6 +354,12 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 'onpath_truncate needs a band edge: set band_t_split (or '
                 'mmd_t_split) so the on-path FM knows where to stop.')
             self.t_split = self.mmd_t_split
+        # onpath: the band rows ARE the sigma >= edge share of reg_ft's batch, so the
+        # dataloader rows must stop at the edge (and the rows' sigma draw reads
+        # self.t_split as that edge)
+        assert self.band_states != 'onpath' or self._truncate_onpath(), (
+            "band_states='onpath' needs the on-path FM truncated at the band edge "
+            "(onpath_truncate True, or 'auto' with emp_fm on).")
         if self.emp_fm_weight == 'mass':
             # MASS MATCHING, applied to the BAND term only. Both FM terms already
             # share self.flow_loss, so they sit on the same per-point footing; what
@@ -382,7 +431,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
 
     # ---- the on-policy band terms -------------------------------------------
 
-    def _expert_velocities(self, x_s, sigma, labels, banks):
+    def _expert_velocities(self, x_s, sigma, labels, banks, exclude=None):
         """The DATA-derived velocities ``(v*_cond, v*_uncond)`` at one visited state.
 
         Both come from the empirical expert's posterior-mean data estimate at ``x_s``,
@@ -399,7 +448,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         each posterior mean to a velocity in the clamp-weighted space the model's own
         ``u_t_pred`` lives in, so model and expert velocities are comparable.
 
-        These are fixed data-derived targets: they carry no gradient.
+        These are fixed data-derived targets: they carry no gradient. ``exclude``
+        (per row, entries of its CONDITIONAL bank to leave out) applies to v*_cond
+        only: the indices mean nothing in the null bank.
         """
         expert = self._dagger_expert
         cond_banks, null_banks = banks
@@ -410,7 +461,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         with torch.no_grad():
             x0_cond = expert.x0_hat(
                 x_s, sigma, self.feat_fn, labels,
-                cond_banks, null_banks, self.null_label)
+                cond_banks, null_banks, self.null_label, exclude=exclude)
             t1 = self._synced_clock(x_s.device)
             x0_uncond = expert.x0_hat(
                 x_s, sigma, self.feat_fn, torch.full_like(labels, self.null_label),
@@ -430,7 +481,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         MSE times this, averaged over rows, is exactly flow_loss's value."""
         return self.flow_loss.rescale_fn(torch.full_like(t, 0.5), t)
 
-    def _band_point_losses(self, x_s, sigma, labels, banks=None):
+    def _band_point_losses(self, x_s, sigma, labels, banks=None, exclude=None):
         """Both on-policy point terms at ONE visited state, sharing one model forward
         and one expert evaluation. Returns ``(gap, fm)``; ``fm`` is ``None`` when the
         empirical FM term is off.
@@ -481,7 +532,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
 
         vs_cond = vs_uncond = vs_fm_c = vs_fm_u = None
         if banks is not None:
-            x0_c, x0_u = self._expert_velocities(x_s, sig_vec, labels, banks)
+            x0_c, x0_u = self._expert_velocities(x_s, sig_vec, labels, banks, exclude)
             # the CFG gap and emp_fm each get their own complement treatment
             vs_cond = self.expert_target(x_s, sig_vec, x0_c, mode=self.cfg_complement_mode)
             vs_uncond = self.expert_target(x_s, sig_vec, x0_u, mode=self.cfg_complement_mode)
@@ -681,7 +732,13 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         ~``m * (1 - (1 - 1/m)^n_rows)`` distinct ones (~13.5 of 21 at the defaults),
         and banks are loaded for exactly those (``traj``). The draw is the same as
         before -- only its timing moves -- so the estimator is unchanged.
+
+        ``band_one_per_traj`` replaces the draw: ``n_rows`` trajectories, row ``j`` on
+        trajectory ``j`` at a uniform band state, and the t=1 rows on ``n_start``
+        further trajectories that are never rolled out (``n_roll`` marks the split).
         """
+        if self.band_one_per_traj:
+            return self._draw_band_plan_one_per_traj(x_0, t_split, batch_labels)
         m = self._band_traj_count(x_0, t_split)
         labels = self._draw_band_labels(m, x_0.device, batch_labels)
         n_rows = self._band_row_count(x_0.size(0))
@@ -698,6 +755,63 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             traj = plan['traj']
             plan['j_start'] = [traj[i] for i in torch.randint(len(traj), (n_start, )).tolist()]
         return plan
+
+    def _draw_band_plan_one_per_traj(self, x_0, t_split, batch_labels=None):
+        """:meth:`_draw_band_plan` under ``band_one_per_traj``: every scored row on its
+        own trajectory. Same row counts and the same uniform t-marginal over the band
+        grid; only the trajectory sharing (and with it the bank count) changes."""
+        n_states = self._n_band_states(x_0, t_split)
+        n_rows = min(self._band_row_count(x_0.size(0)), x_0.size(0))
+        n_start = max(1, int(round(n_rows / max(n_states, 1)))) \
+            if self.band_score_start else 0
+        n_start = min(n_start, x_0.size(0) - n_rows)
+        labels = self._draw_band_labels(n_rows + n_start, x_0.device, batch_labels)
+        plan = dict(labels=labels, j_pick=list(range(n_rows)),
+                    k_pick=torch.randint(n_states, (n_rows, )).tolist(),
+                    n_states=n_states, traj=list(range(n_rows + n_start)),
+                    n_roll=n_rows)
+        if n_start:
+            plan['j_start'] = list(range(n_rows, n_rows + n_start))
+        return plan
+
+    def _draw_plan_paths(self, plan):
+        """The bank path draw for ``plan`` (both the prefetch and the synchronous
+        fallback go through here). Under ``band_states='onpath'`` it also fixes each
+        row's image -- see :meth:`_place_onpath_images`."""
+        labels = plan['labels']
+        # the null restriction still follows the rollout's FULL class set, not just
+        # the scored trajectories', so band_null_from_batch means what it did before
+        drawn = self._dagger_expert.draw_bank_paths(
+            self._plan_bank_labels(plan),
+            null_classes=labels.tolist() if self.band_null_from_batch else None)
+        if self.band_states == 'onpath':
+            self._place_onpath_images(plan, drawn)
+        return drawn
+
+    def _place_onpath_images(self, plan, drawn):
+        """Choose each onpath row's image at DRAW time, before any IO: a uniform image
+        of the row's class bank in a uniform orientation, recorded as its bank entry
+        ``plan['x0_entry'][r]`` (the bank's rows follow ``cond_paths`` order, and
+        flips sit at ``+ n``). Under ``band_onpath_keep`` the image is also written
+        into the row's NULL bank -- replacing one random draw, so the bank keeps its
+        size -- so both posteriors contain it, as the full empirical distribution
+        does; otherwise it is in the null bank only by chance (~null_bank_size / 1.28M)."""
+        n_orient = 2 if self._dagger_expert.include_flips else 1
+        entries, taken = [], {}
+        for r in range(len(plan['traj'])):
+            cond = drawn['cond_paths'][drawn['cond_index'][r]]
+            j = int(torch.randint(len(cond), ()))
+            entries.append(int(torch.randint(n_orient, ())) * len(cond) + j)
+            if self.band_onpath_keep:
+                null = drawn['null_paths'][drawn['null_index'][r]]
+                if cond[j] not in null:
+                    # never overwrite an image an earlier row placed (shared null bank)
+                    used = taken.setdefault(id(null), set())
+                    free = [i for i in range(len(null)) if i not in used]
+                    i = free[int(torch.randint(len(free), ()))]
+                    null[i] = cond[j]
+                    used.add(i)
+        plan['x0_entry'] = entries
 
     def _prefetch_banks(self, plan):
         """Issue the bank IO BEFORE the flow-matching step, mirroring the MMD target
@@ -720,12 +834,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             return
         if self._bank_pool is None:
             self._bank_pool = ThreadPoolExecutor(max_workers=1)
-        labels = plan['labels']
-        # the null restriction still follows the rollout's FULL class set, not just
-        # the scored trajectories', so band_null_from_batch means what it did before
-        drawn = expert.draw_bank_paths(
-            self._plan_bank_labels(plan),
-            null_classes=labels.tolist() if self.band_null_from_batch else None)
+        drawn = self._draw_plan_paths(plan)
         # the reusable (pinned) host buffer is leased HERE, on the main thread, so
         # the prefetch thread only ever writes host memory; None -> fresh memory
         lease = expert.lease_host_buffer(drawn)
@@ -808,11 +917,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             loaded = self._bank_pending.result()      # in flight since forward_train
             self._bank_pending = None
         else:                                         # fallback: synchronous, IO inline
-            labels = plan['labels']
-            drawn = expert.draw_bank_paths(
-                self._plan_bank_labels(plan),
-                null_classes=labels.tolist() if self.band_null_from_batch else None)
-            loaded = self._timed_load(expert, drawn, t_consume)
+            loaded = self._timed_load(expert, self._draw_plan_paths(plan), t_consume)
         t_ready = time.perf_counter()
         self._band_lease = loaded.get('lease')    # released at the end of this band
         banks = expert.finish_banks(loaded, encode_fn, self.feat_fn, device)
@@ -907,6 +1012,35 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             fits = bt['band_t_window'] / per_img_load      # images loadable in the window
             bt['null_bank_max_hidden'] = max(fits - n_cond_imgs, 0.0) / len(null_u8)
 
+    @torch.no_grad()
+    def _onpath_band_states(self, plan, banks, x_ref):
+        """``band_states='onpath'``: one noised REAL image per row, and the entries
+        its conditional posterior leaves out. Row ``r``'s image is the class-bank
+        entry fixed at draw time (:meth:`_place_onpath_images`: a uniform image of
+        the class, either orientation), at a sigma from the training timestep
+        sampler truncated to sigma >= the band edge (_sample_t_above_split, the draw
+        reg_ft's own carve uses), so the band's states and sigma marginal are
+        reg_ft's and only the target changes. Unless ``band_onpath_keep``, both
+        orientations of the image are excluded, or the posterior would find x0
+        itself and hand back eps - x0. Returns ``(x_t, sigma, exclude)``."""
+        from .experts.empirical_expert import U8Bank
+        assert banks is not None, (
+            "band_states='onpath' reads its images out of the expert's class banks; "
+            'no term that builds banks is on.')
+        device = x_ref.device
+        x0, exclude = [], []
+        for r, k in enumerate(plan['x0_entry']):
+            bank = banks[0][r]          # plan['traj'] is range(n_rows) under 1pt
+            assert isinstance(bank, U8Bank), (
+                "band_states='onpath' needs the expert's bank_storage='u8'.")
+            x0.append(bank.entry(k, device))
+            exclude.append(None if self.band_onpath_keep else bank.orientations(k))
+        x0 = torch.stack(x0).to(x_ref.dtype)
+        t = self._sample_t_above_split(x0.size(0), x0.shape[2:].numel(), device)
+        t = t.clamp(max=self.num_timesteps)
+        x_t, _, _ = self.sample_forward_diffusion(x0, t, torch.randn_like(x0))
+        return x_t, t / self.num_timesteps, exclude
+
     def _onpolicy_loss(self, x_0, plan, t_split, encode_fn=None):
         """One shared band rollout; the CFG-gap and (optional) MMD terms on top.
         ``plan`` (from :meth:`_draw_band_plan`) fixes the classes and scored pairs."""
@@ -915,6 +1049,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         labels = plan['labels']
         m = labels.numel()
         x_0 = x_0[:m].detach()
+        # band_one_per_traj: only the first n_roll trajectories are rolled out; the
+        # rest carry a t=1 row alone (see _draw_band_plan_one_per_traj)
+        n_roll = plan.get('n_roll', m)
 
         use_mmd = self.mmd_weight != 0
         use_fm = self.emp_fm_weight != 0
@@ -928,11 +1065,23 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # band_score_start: the point terms also score the t=1 start state. It is split
         # off here, so `states` stays the landing states the plan and MMD index.
         with_start = self.band_score_start and use_point and plan.get('j_start')
-        with ctx:
-            states = self._band_rollout(x_0, labels, t_split, include_start=bool(with_start))
+        onpath = self.band_states == 'onpath'
+        if onpath:
+            states, n_roll = [], 0    # no rollout: the rows are built from the banks below
+        else:
+            with ctx:
+                states = self._band_rollout(x_0[:n_roll], labels[:n_roll], t_split,
+                                            include_start=bool(with_start))
         start = None
         if with_start:
             start, states = states[0], states[1:]
+            if n_roll < m:
+                # the start-only trajectories: noise drawn exactly as _band_rollout
+                # draws its start, never stepped
+                sampler = self._build_mmd_sampler(x_0.shape[2:].numel(), x_0.device)
+                noise = (sampler.timesteps[0] / self.num_timesteps) \
+                    * torch.randn_like(x_0[n_roll:])
+                start = (start[0], torch.cat([start[1], noise]))
 
         # ONE band state per trajectory, drawn uniformly -- so the band contributes
         # exactly m rows with the band's own t-marginal, and the point terms are an
@@ -972,6 +1121,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         banks = None
         if self._needs_banks():
             banks = self._build_gap_banks(plan, encode_fn, x_0.device)
+        exclude = None
+        if onpath and use_point:
+            x_pick, sig_pick, exclude = self._onpath_band_states(plan, banks, x_0)
+            pick = (x_pick, sig_pick, labels, list(range(m)), None)
 
         gap_sigmas, gap_vals, fm_vals = [], [], []
         self_vals, cross_vals, cos_vals, frac_vals = [], [], [], []
@@ -985,7 +1138,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 banks_pick = ([banks[0][pos[j]] for j in pick[3]],
                               [banks[1][pos[j]] for j in pick[3]])
             gap, fm, fmdiag, gsplit, self_sq, cross, cos = self._band_point_losses(
-                pick[0], pick[1], pick[2], banks=banks_pick)
+                pick[0], pick[1], pick[2], banks=banks_pick, exclude=exclude)
             gap_sigmas.append(float(pick[1].mean()))
             if True:
                 if gap is not None:
@@ -1012,7 +1165,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             # independent 'uniform'/'prior' draws take their targets from disk by
             # label (GaussianFlowMMD._target_per_row).
             mmd_loss, mmd_log_vars = self._mmd_score(
-                states, x_0, labels,
+                states, x_0[:n_roll], labels[:n_roll],
                 rows_match=self.band_class_sampling == 'batch')
 
         # *mmd_accum_steps cancels train_grad_accum's 1/N (both terms run on ONE
@@ -1026,7 +1179,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         acc = float(self.mmd_accum_steps)
         loss = x_0.new_zeros(())
         log_vars = dict(band_steps=loss.new_tensor(float(len(states)) * acc),
-                        band_traj=loss.new_tensor(float(m)),
+                        band_traj=loss.new_tensor(float(n_roll)),
                         band_banks=loss.new_tensor(
                             float(len(plan['traj'])) if banks is not None else 0.0),
                         band_rows=loss.new_tensor(

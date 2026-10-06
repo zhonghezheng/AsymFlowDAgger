@@ -126,6 +126,10 @@ model = dict(
         # rollout width AND the number of bank sets built per banded iteration --
         # the cost driver above, not just a variance knob.
         band_batch=16,
+        # pinned to the pre-2026-10-03 sampling (independent draws with replacement
+        # over band_batch rollouts): the run name is untagged, so the new class default
+        # (one point per trajectory) must not change what this config's runs mean
+        band_one_per_traj=False,
         band_sampler='FlowHeunODE',
         # --- optional MMD term (off by default) ---
         mmd_weight=float(os.environ.get('LAKON_MMD_WEIGHT', 0.0)),
