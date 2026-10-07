@@ -98,6 +98,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
     case: the CFG-gap term alone needs no trajectory graph), and with the graph only
     when ``mmd_weight != 0``. Turning MMD on is what makes the band expensive.
 
+    Both the rollout and the point terms' forward run the net in EVAL mode -- the
+    deterministic function the sampler uses -- so neither the visited states nor
+    v_cond / v_uncond carry dropout noise; only the on-path FM rows train with dropout.
+
     The expert is still needed -- it supplies ``v*`` -- but only its banks, built
     fresh each iteration the band runs and never cached across weight updates. What
     is gone is the replay BUFFER of rollout states: the ``DaggerRolloutHook`` must
@@ -429,6 +433,37 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # (the bank averaging above is the expensive part, done once).
         return x0_cond.detach(), x0_uncond.detach()
 
+    @contextlib.contextmanager
+    def _dropout_off(self):
+        """The band's point-term forward in EVAL mode: no dropout, the function the
+        sampler runs (and the rollout's _ckpt_pred already uses). In train mode each
+        half of the [cond; null] forward draws its own dropout mask, which adds
+        Var_m(v_c) + Var_m(v_u) to the gap and to emp_fm as a floor no update can
+        remove (tools/cfg_gap_floor.py measures it). Eval also swaps AsymJiT's
+        assembly clamp to its inference sigma_min, which acts only far below the band.
+
+        Backward safety: the net checkpoints per block, and a checkpoint recomputes
+        DURING loss.backward(), after train mode is back. Under torch.compile the
+        recompute is part of the compiled backward, traced here in eval mode, so it is
+        exact. Eager has no such graph -- it would re-run the blocks with dropout on
+        -- so there the per-block checkpointing is off for this forward instead (only
+        the band's 2 * band_rows rows)."""
+        net = self.denoising
+        if not net.training:
+            yield
+            return
+        eager_ckpt = (getattr(net, '_compiled_forward', None) is None
+                      and getattr(net, 'gradient_checkpointing', False))
+        net.eval()
+        if eager_ckpt:
+            net.gradient_checkpointing = False
+        try:
+            yield
+        finally:
+            net.train()
+            if eager_ckpt:
+                net.gradient_checkpointing = True
+
     def _loss_row_weights(self, t):
         """The flow loss's per-row weight at timesteps ``t``: what it multiplies a row's
         flat-mean squared error by (its internal 0.5, then rescale_fn). A plain per-row
@@ -445,8 +480,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         wherever that weight is used.
 
         The model's two branches come from a single batched forward over ``[x_s; x_s]``
-        with ``[labels; null]``, so the pair is evaluated under identical activations
-        and costs one forward of ``2m`` rows rather than two of ``m``. Velocities are
+        with ``[labels; null]`` in eval mode (no dropout, see :meth:`_dropout_off`), so
+        the pair is evaluated by the deterministic net inference runs and costs one
+        forward of ``2m`` rows rather than two of ``m``. Velocities are
         taken in GaussianFlow's clamp-weighted space (``output * clamp_coef``, the
         ``u_t_pred`` the flow loss regresses), which is also what ``expert_target``
         returns.
@@ -487,7 +523,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         both = torch.cat([x_s, x_s], dim=0)
         cond_null = torch.cat(
             [labels, torch.full_like(labels, self.null_label)], dim=0)
-        out = self.pred(both, torch.cat([t, t], dim=0), class_labels=cond_null)
+        with self._dropout_off():
+            out = self.pred(both, torch.cat([t, t], dim=0), class_labels=cond_null)
         _, _, clamp_coef = self.get_clamp_coef(t=t, x_t=x_s)
         v_cond, v_uncond = out.chunk(2, dim=0)
         v_cond = v_cond * clamp_coef

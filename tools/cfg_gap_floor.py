@@ -1,8 +1,9 @@
 """How much of the logged cfg_gap can training actually remove?
 
 The band's CFG-gap loss is a plain mean of || (v_c - v_u) - (v*_c - v*_u) ||^2 with both
-branches from ONE batched train-mode forward over [x; x] (GaussianFlowOnPolicy.
-_band_point_losses; GaussianFlowDagger's buffered gap likewise). Dropout
+branches from ONE batched forward over [x; x] -- train mode in runs before 2026-10-07
+(GaussianFlowDagger's buffered gap still is), EVAL mode since (GaussianFlowOnPolicy.
+_band_point_losses), so for those runs the trained loss is gap_eval below. Dropout
 (proj_dropout=0.2, middle half of the blocks) draws an INDEPENDENT mask for each half, and
 v* = (x_t - x0_hat)/sigma averages a RANDOM null bank (per-trajectory draw, ESS ~1-5).
 So in expectation over masks m1, m2 and bank draws
