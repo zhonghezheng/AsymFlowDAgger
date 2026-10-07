@@ -96,18 +96,11 @@ model = dict(
         # loss arithmetic. Logged as emp_fm through self.flow_loss, hence directly
         # comparable to the DAGGER arms' loss_dagger (and small, since the
         # logit-normal rescale down-weights this sigma range hard).
-        # 'mass' -> p_high = P(sigma >= band_t_split), so the band term carries
-        # exactly the sigma mass it has in reg_ft and matches the on-path term's
-        # p_low factor. At band_t_split=0.9 that resolves to ~0.1; weighting it 1.0
-        # would give sigma >= 0.9 ten times its share, and would shift the useful
-        # range of w_cfg / w_align (which are read against emp_fm) by a decade.
-        emp_fm_weight=(lambda v: v if v == 'mass' else float(v))(
-            os.environ.get('LAKON_EMP_FM_WEIGHT', 'mass')),
-        # MEMORY knob: each scored state retains its own 2 x band_batch forward
-        # graph. All 6 states at band_batch=64 would hold ~768 rows of activations,
-        # several times the bs=256 FM step; 2 keeps the band comparable to it.
-        # Unbiased over iterations -- the states are drawn uniformly each time.
-        cfg_gap_max_states=2,
+        # Per-row multiplier on the emp_fm rows inside the shared FM mean: the rows
+        # replace that many on-path rows, so 1.0 is parity and the band carries
+        # exactly the sigma mass it has in reg_ft (see GaussianFlowOnPolicy, "Loss
+        # composition").
+        emp_fm_weight=float(os.environ.get('LAKON_EMP_FM_WEIGHT', 1.0)),
         # False = the literal loss, both branches differentiated (they meet in the
         # middle). True would freeze the unconditional field and move only the
         # conditional one toward it.
@@ -123,13 +116,10 @@ model = dict(
         # being exactly N(0,I) and carrying no class information).
         band_t_split=float(os.environ.get('LAKON_BAND_TSPLIT', 0.9)),
         band_nfe=50,             # match the eval sampler's NFE grid
-        # rollout width AND the number of bank sets built per banded iteration --
-        # the cost driver above, not just a variance knob.
-        band_batch=16,
-        # pinned to the pre-2026-10-03 sampling (independent draws with replacement
-        # over band_batch rollouts): the run name is untagged, so the new class default
-        # (one point per trajectory) must not change what this config's runs mean
-        band_one_per_traj=False,
+        # NB one point per trajectory is now hard-coded (band_rows trajectories, one
+        # bank each). Runs of this config before 2026-10-06 used the old sampling --
+        # band_rows independent draws over band_batch=16 rollouts -- under the SAME
+        # untagged name, so a rerun is not like-for-like with them.
         band_sampler='FlowHeunODE',
         # --- optional MMD term (off by default) ---
         mmd_weight=float(os.environ.get('LAKON_MMD_WEIGHT', 0.0)),

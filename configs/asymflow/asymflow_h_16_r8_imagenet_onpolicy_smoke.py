@@ -7,9 +7,9 @@ and every iteration logs cfg_gap plus the per-state values, so this also reveals
 raw gap scale relative to loss_diffusion -- which is what cfg_gap_weight has to be
 set against. Launch with --no-validate.
 
-LAKON_CFG_GAP_STATES caps the scored states (the memory knob); set it to 6 to price
-the whole band. LAKON_MMD_WEIGHT additionally switches the MMD term on, which makes
-the rollout differentiable -- expect a large jump in memory.
+One point per trajectory (hard-coded): band_rows rows, one band state each.
+LAKON_MMD_WEIGHT additionally switches the MMD term on, which makes the rollout
+differentiable -- expect a large jump in memory.
 """
 
 import os
@@ -24,8 +24,6 @@ total_iters = 8
 model = dict(
     diffusion=dict(
         mmd_start_iter=0,   # exercise the band immediately
-        cfg_gap_max_states=int(os.environ.get('LAKON_CFG_GAP_STATES', 2)),
-        band_batch=int(os.environ.get('LAKON_BAND_BATCH', 16)),
     ),
 )
 

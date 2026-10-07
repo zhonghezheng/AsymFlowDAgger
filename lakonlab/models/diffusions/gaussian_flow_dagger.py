@@ -315,18 +315,14 @@ class GaussianFlowDagger(GaussianFlow):
                 v_cond, v_uncond = out2.chunk(2, dim=0)
                 v_cond = v_cond * clamp_coef
                 v_uncond = v_uncond * clamp_coef
-                vs_cond = self.expert_target(x_t, sigma, buffer_batch['x0_cond'])
-                vs_uncond = self.expert_target(x_t, sigma, buffer_batch['x0_null'])
+                # the CFG gap's target is always 'full' (whatever complement_mode the
+                # DAGGER regression uses): x_t cancels between the branches, leaving
+                # (x0_null - x0_cond) / sigma_c
+                vs_cond = self.expert_target(x_t, sigma, buffer_batch['x0_cond'], mode='full')
+                vs_uncond = self.expert_target(x_t, sigma, buffer_batch['x0_null'], mode='full')
                 gap = ((v_cond - v_uncond) - (vs_cond - vs_uncond)).pow(2).mean()
                 loss = loss + self.cfg_gap_weight * gap
                 log_vars['cfg_gap'] = gap.detach()
                 log_vars['loss_cfg_gap'] = (self.cfg_gap_weight * gap).detach()
-                with torch.no_grad():
-                    a = v_cond - vs_cond
-                    b = v_uncond - vs_uncond
-                    af, bf = a.flatten(1), b.flatten(1)
-                    log_vars['cfg_cos'] = (
-                        (af * bf).sum(-1) / af.norm(dim=-1).clamp_min(1e-6)
-                        / bf.norm(dim=-1).clamp_min(1e-6)).mean()
 
         return loss, log_vars

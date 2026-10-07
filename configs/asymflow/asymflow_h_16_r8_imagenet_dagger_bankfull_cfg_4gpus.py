@@ -5,28 +5,34 @@ Base: asymflow_h_16_r8_imagenet_dagger_full_bankfull_4gpus.py for the expert
 reproduced, but every rollout point is generated fresh with the CURRENT weights each
 banded iteration instead of being replayed from a buffer up to 500 iterations stale:
 
-    loss = w_on   * mean_onpath [ sigma < 0.92, PLUS a real-data mix-in inside the band ]
-         + w_emp  * mean_online_rollout [ v* target, one branch per point, 10% dropout ]
-         + w_cfg  * mean_online_rollout || (v_cond - v_uncond) - (v*_cond - v*_uncond) ||^2
+    loss = mean_batch [ on-path rows (sigma < 0.92, PLUS a real-data share of the band)
+                        and online rollout rows (v* target, one branch per point,
+                        10% dropout) ]
+         + w_cfg * mean_online_rollout || (v_cond - v_uncond) - (v*_cond - v*_uncond) ||^2
 
-Mass matching (band_frac_on_path=0.5, DAGGER's frac_on_path), with p_high = P(sigma
->= 0.92) = 0.08 measured from the model's own timestep sampler:
+The FM part is ONE mean over the per-GPU batch, as in d-flow and DAGGER's carve: the
+rollout rows replace as many on-path rows, so every row weighs 1/256 and the row
+counts carry reg_ft's sigma allocation. With p_high = P(sigma >= 0.92) = 0.08 from the
+model's own timestep sampler and band_frac_on_path f=0.5 (DAGGER's frac_on_path):
 
-    w_on  = p_low + p_high*f = 0.96      <- 4.17% of on-path rows drawn from the band
-    w_emp = p_high*(1 - f)   = 0.04
-    ------------------------------------
-    total                    = 1.00      <- exactly reg_ft's sigma allocation
+    on-path, sigma < 0.92   236 rows
+    on-path, sigma >= 0.92   10 rows    <- the band's GROUND-TRUTH anchor
+    rollout, v* target       10 rows    <- round(p_high (1 - f) 256)
+    -----------------------------------
+    total                   256 rows
 
-so half the band keeps a GROUND-TRUTH anchor and the expert owns only the other half.
-The previous buffer-free arms had no such anchor (frac_on_path was dead config), which
-left v* -- a smoothed bank average -- supervising the band alone.
+The rollout rows sit on the solver grid (0.98..0.92), so each carries its grid
+cell's average logit-normal weight rather than the weight at its state (see
+GaussianFlowOnPolicy._band_grid). Without the f share the band has no anchor and v*
+-- a smoothed bank average -- supervises it alone.
 
-w_cfg is added OUTSIDE that normalisation with its own weight, so w_cfg=0 is the
-control: online DAGGER with no CFG term.
+w_cfg is added OUTSIDE that mean with its own weight, so w_cfg=0 is the control:
+online DAGGER with no CFG term.
 
 COST: no buffer means banks are rebuilt every banded iteration rather than once per
-500-iteration round -- band_batch * (~1300 + 2048) images at ~500 img/s. Budget with
-band_batch (default 'auto', = 5 here) and LAKON_BAND_INTERVAL (default 1).
+500-iteration round -- band_rows * (~1300 + 2048) images at ~500 img/s (one bank per
+row, one row per trajectory). Budget with band_rows (default 'auto', = 10 here) and
+LAKON_BAND_INTERVAL (default 1).
 """
 
 import os
@@ -34,7 +40,7 @@ import os
 _base_ = ['./asymflow_h_16_r8_imagenet_dagger_full_bankfull_4gpus.py']
 
 _w = os.environ.get('LAKON_CFG_GAP_WEIGHT', '0')
-# band_frac_on_path: share of the band's sigma mass kept on REAL data (true velocity)
+# band_frac_on_path: share of the band's ROWS kept on REAL data (true velocity)
 # instead of the expert. 0.5 = DAGGER's setting; 0.0 = expert owns the band outright,
 # which is what every earlier buffer-free arm silently did.
 _f = os.environ.get('LAKON_BAND_FRAC', '0.5')
@@ -68,7 +74,7 @@ _ftag = str(int(round(float(_f) * 100)))
 #
 # Verified prerequisites for the equivalence: scale_buffer = 1.0 -> sk = 1 at all
 # sigma, and proj_buffer orthonormal to 3.2e-5.
-_ccm = 'full'      # CFG gap        -- do not project
+_ccm = 'full'      # CFG gap        -- always 'full' in GaussianFlowOnPolicy; kept for the name
 _fcm = 'full'      # emp_fm         -- do not project
 _cmtag = f'cm{_ccm[0]}{_fcm[0]}'                   # always 'cmff'
 
@@ -137,8 +143,8 @@ _clstag += '' if _kspace == 'feat' else '_klat'
 # per-GPU batch. Default 256 = the 4xH200 layout every run so far used (global 1024).
 # For 8 GPUs set 128: global batch stays 1024, per-GPU activations halve (the 256
 # layout peaks ~130 GB, over an 80 GB H100), no grad accumulation is needed so
-# mmd_accum_steps=1 stays correct, and the band's trajectory count -- round(p_high *
-# per-GPU batch) -- stays matched in total (8 x ~10-11 vs 4 x 21). Tagged when off
+# mmd_accum_steps=1 stays correct, and the band's trajectory count -- band_rows 'auto',
+# proportional to the per-GPU batch -- stays matched in total. Tagged when off
 # default so an 8-GPU run can never share a name with its 4-GPU counterpart.
 _spg = int(os.environ.get('LAKON_SAMPLES_PER_GPU', 256))
 _clstag += '' if _spg == 256 else f'_bs{_spg}'
@@ -147,9 +153,8 @@ _clstag += '' if _spg == 256 else f'_bs{_spg}'
 # 4xH100 at the 4xH200 layout is LAKON_SAMPLES_PER_GPU=256 LAKON_GRAD_ACCUM=64. The band
 # terms run on ONE micro-batch per step and are rescaled by mmd_accum_steps to cancel
 # train_grad_accum's 1/N, so that factor is derived here, never set by hand.
-# NB band_batch / band_rows 'auto' read the MICRO-batch size, so under accumulation they
-# shrink by the same factor -- pin LAKON_BAND_BATCH / LAKON_BAND_ROWS to keep the band's
-# per-step size (round(p_high * per-GPU batch): 20 at 256 and t_split=0.92).
+# band_rows 'auto' reads the per-GPU batch (micro-batch * mmd_accum_steps), so the
+# band's per-step size does not move with accumulation.
 _mbs = os.environ.get('LAKON_GRAD_ACCUM')
 assert not _mbs or _spg % int(_mbs) == 0, \
     f'LAKON_GRAD_ACCUM={_mbs} must divide LAKON_SAMPLES_PER_GPU={_spg}'
@@ -183,30 +188,25 @@ assert _thi is None or _thi > _bt, (_bt, _thi)
 _clstag += '' if _thi is None else f'_th{_thi:g}'
 # LAKON_EMP_FM=0: no empirical-expert FM in the band (emp_fm_weight 0), so on-path FM is
 # NOT truncated ('auto' keys on emp_fm) and covers the full sigma range as reg_ft does;
-# only the CFG-gap term (w) sits on the band. Default 1 = 'mass', every earlier run.
-# Tagged '_nofm'.
+# only the CFG-gap term (w) sits on the band. Default 1 = emp_fm on. Tagged '_nofm'.
 _efm = os.environ.get('LAKON_EMP_FM', '1') != '0'
 _clstag += '' if _efm else '_nofm'
 # With emp_fm on, on-path FM is truncated at the band's LOWER edge while emp_fm scores
-# only [t_split, t_hi] -- sigma in (t_hi, 1] would get no FM, and 'mass' / band_rows
-# 'auto' would count it. Not supported: an upper edge needs emp_fm off.
+# only [t_split, t_hi] -- sigma in (t_hi, 1] would get no FM, and band_rows 'auto'
+# would count it. Not supported: an upper edge needs emp_fm off.
 assert _thi is None or not _efm, 'LAKON_BAND_THI needs LAKON_EMP_FM=0.'
-# LAKON_BAND_1PT (DEFAULT 1 since 2026-10-03): ONE scored point per trajectory
-# (band_one_per_traj). LAKON_BAND_1PT=0 restores the old sampling, untagged. The band
-# rolls out exactly band_rows trajectories (round(p_high * batch), band_batch ignored)
-# and scores each at one uniform band state, instead of band_rows independent
-# (trajectory, state) draws with replacement over band_batch rollouts (which hit
-# ~10 of 15 trajectories at bs128, some twice). The t=1 rows of LAKON_CFG_START get
-# noise-only trajectories of their own. One bank per row: ~18 vs ~10 at bs128.
-# Tagged '_1pt' whenever on (default included), so every run name keeps saying which
-# sampling it used and the untagged names still mean the old one.
-_one = os.environ.get('LAKON_BAND_1PT', '1') != '0'
-_clstag += '_1pt' if _one else ''
+# ONE scored point per trajectory -- hard-coded in GaussianFlowOnPolicy since
+# 2026-10-06 (default since 2026-10-03; LAKON_BAND_1PT is gone). The band rolls out
+# exactly band_rows trajectories (see band_rows below) and scores each at one uniform
+# band state; the t=1 rows of LAKON_CFG_START get noise-only trajectories of their own.
+# The '_1pt' tag stays in every name, so existing run names (and their resumes) are
+# unchanged; untagged names are runs from before, with independent draws.
+_clstag += '_1pt'
 # LAKON_BAND_SOURCE=onpath -- the regft_emp arm. NO rollout: the band's rows are REAL
 # images noised to sigma >= the band edge from the training timestep sampler (reg_ft's
 # own band), and only the target changes, ε - x0 -> v*. Each row's image is left out of
 # its own conditional posterior, or v* would collapse back onto ε - x0 (see
-# GaussianFlowOnPolicy band_states). Everything else -- banks, temperature, emp_fm mass,
+# GaussianFlowOnPolicy band_states). Everything else -- banks, temperature, the carve,
 # truncation -- is this config's, so it pairs with the rollout arm of the same tags.
 # Named regft_emp_* instead of dagger_bankfull_*; the default leaves every name as is.
 _bsrc = os.environ.get('LAKON_BAND_SOURCE', 'rollout')
@@ -249,30 +249,22 @@ model = dict(
     type='GaussianFlowOnPolicy',
     # --- the online CFG term ---
     cfg_gap_weight=float(_w),
-    cfg_complement_mode=_ccm,
     emp_fm_complement_mode=_fcm,
     cfg_gap_target='expert',
-    cfg_align_weight=0.0,
-    emp_fm_weight='mass' if _efm else 0.0,   # p_high*(1-f): the band's share, minus real data's half
+    emp_fm_weight=1.0 if _efm else 0.0,   # per-row parity inside the shared FM mean
     mmd_t_hi=_thi,
     mmd_weight=0.0,
     allow_no_band_term=True,  # lets the w_cfg=0 control run through the same path
     onpath_truncate='auto',   # on-path FM stops at the band edge (emp_fm owns it)
-    onpath_truncate_rescale=True,
     band_frac_on_path=float(_f),
     null_label=1000,
     # --- the online band: matches DAGGER's t_split so both cover the same sigmas ---
     band_t_split=_bt,
     band_nfe=50,
-    # 'auto' -> round(p_high * batch / n_band_states): the band supplies the same
-    # point budget the DAGGER carve gives sigma >= t_split. At t_split=0.92, nfe=50,
-    # batch=256 that is 5; the old hardcoded 4 under-filled the band by ~20%.
-    band_batch=os.environ.get('LAKON_BAND_BATCH', 'auto'),
-    # band_rows: how many (trajectory, band-time) PAIRS the CFG-gap and emp_fm terms
-    # score, drawn independently -- decoupled from band_batch (how many trajectories
-    # are rolled out, one expert bank each). 'auto' = round(p_high * batch) = the
-    # band's own point budget, so the band keeps its share of the objective; raise it
-    # for a lower-variance estimate without paying for more banks.
+    # band_rows: how many rows the CFG-gap and emp_fm terms score, ONE per trajectory,
+    # so also the rollout width and the bank count. 'auto' = the expert's rows in the
+    # carve, round(p_high * (1 - f) * per-GPU batch): 10 at f=0.5, 20 at f=0 (256,
+    # t_split=0.92); round(p_high * batch) = 20 with emp_fm off.
     band_rows=os.environ.get('LAKON_BAND_ROWS', 'auto'),
     # Rollout classes drawn INDEPENDENTLY of the minibatch ('prior' = the dataset's
     # class counts, matching the on-path stream and the buffered DAGGER hook's
@@ -281,7 +273,7 @@ model = dict(
     # a future batch -- the next band's expert banks can be loaded a full interval
     # ahead (true double-buffering) instead of one FM step ahead.
     band_class_sampling=os.environ.get('LAKON_BAND_CLASSES', 'prior'),
-    # Confine the band to this many DISTINCT classes (~band_batch/C trajectories each
+    # Confine the band to this many DISTINCT classes (~band_rows/C trajectories each
     # instead of ~1). Unset -> unrestricted.
     band_classes_per_batch=(int(os.environ['LAKON_BAND_NCLS'])
                             if os.environ.get('LAKON_BAND_NCLS') else None),
@@ -291,9 +283,7 @@ model = dict(
     # actually sits in, instead of against the 1000-class marginal.
     band_null_from_batch=bool(int(os.environ.get('LAKON_BAND_NULLBATCH', '0'))),
     band_sampler='FlowHeunODE',
-    cfg_gap_max_states=int(os.environ.get('LAKON_BAND_STATES', 6)),
     band_score_start=_cstart,
-    band_one_per_traj=_one,
     band_states=_bsrc,
     band_onpath_keep=_keep,
     cfg_gap_reweight=_crw,

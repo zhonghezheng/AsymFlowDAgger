@@ -5,6 +5,7 @@ import inspect
 
 import os.path as osp
 import random
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -161,6 +162,87 @@ def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1
     return total / len(bandwidths)
 
 
+def mmd2_rbf_sharded(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), eps=1e-12):
+    """:func:`mmd2_rbf` (``width='mean'``, unbiased) over the POOLED sets of every DDP
+    rank, with the kernel matrices ROW-SHARDED across ranks instead of computed whole
+    on each one.
+
+    ``fx`` / ``fy`` are this rank's rollout / target rows (equal counts on every rank,
+    as ``all_gather`` requires). Rank r holds rows ``r*m_loc ..`` of the pooled sets
+    and computes only its own rows of K_xx, K_xy and K_yy against the full gathered
+    sets; the partial sums are all-reduced. Per rank that is 1/world_size of the
+    pooled kernel work and memory -- at 10k raw targets the target-target block alone
+    is ~41 TFLOP per band state if every rank computes it whole.
+
+    Returns ``(value, surrogate)``. ``value`` is the pooled MMD^2 (detached, identical
+    on every rank). ``surrogate`` is a LOCAL scalar whose gradient w.r.t. ``fx`` is
+    exactly d(value)/d(fx) for this rank's rows: K_xx is symmetric, so
+    d/dx_i sum_{a!=b} k(x_a, x_b) = 2 sum_{j!=i} d_1 k(x_i, x_j), which is what
+    2 * sum_{j!=i} k(x_i, x_j.detach()) differentiates to. Its VALUE is not the MMD.
+
+    Distances in full fp32 (TF32 off): at sigma >= 0.88 the raw pairwise d2 are all
+    ~2*D*sigma^2 to within a fraction of a percent, the regime where TF32's rounding
+    is as large as the spread the kernel is meant to resolve.
+    """
+    fx = fx.float()
+    fy = fy.float().detach()
+    if dist.is_available() and dist.is_initialized():
+        ws, rank = dist.get_world_size(), dist.get_rank()
+    else:
+        ws, rank = 1, 0
+
+    def gather(t):
+        if ws == 1:
+            return t
+        buf = [torch.empty_like(t) for _ in range(ws)]
+        dist.all_gather(buf, t.contiguous())
+        return torch.cat(buf, dim=0)
+
+    def all_sum(t):
+        if ws > 1:
+            dist.all_reduce(t)
+        return t
+
+    m_loc, n_loc = fx.shape[0], fy.shape[0]
+    fx_all = gather(fx.detach())
+    fy_all = gather(fy)
+    m, n = fx_all.shape[0], fy_all.shape[0]
+    assert m > 1 and n > 1, (
+        f'MMD^2 needs at least 2 samples per side, got m={m}, n={n}.')
+    with _no_tf32():
+        d_xx = _pdist2(fx, fx_all)                      # [m_loc, m], grad via rows
+        d_xy = _pdist2(fx, fy_all)                      # [m_loc, n]
+        with torch.no_grad():
+            d_yy = _pdist2(fy, fy_all)                  # [n_loc, n]
+    del fx_all, fy_all
+    # self-pairs: local row i is pooled column rank * m_loc + i
+    ix = torch.arange(m_loc, device=fx.device)
+    iy = torch.arange(n_loc, device=fx.device)
+    eye_x = torch.zeros(m_loc, m, dtype=torch.bool, device=fx.device)
+    eye_x[ix, rank * m_loc + ix] = True
+    eye_y = torch.zeros(n_loc, n, dtype=torch.bool, device=fx.device)
+    eye_y[iy, rank * n_loc + iy] = True
+
+    with torch.no_grad():
+        # mean off-diagonal target d2 over ALL pooled pairs (the 'mean' width rule)
+        scale = all_sum(d_yy.masked_fill(eye_y, 0.0).double().sum())
+        scale = (scale / (n * (n - 1))).float().clamp_min(eps)
+    s_xx, s_xy, s_yy = 0.0, 0.0, 0.0
+    for mult in bandwidths:
+        denom = scale * mult
+        s_xx = s_xx + torch.exp(-d_xx / denom).masked_fill(eye_x, 0.0).sum()
+        s_xy = s_xy + torch.exp(-d_xy / denom).sum()
+        with torch.no_grad():
+            s_yy = s_yy + torch.exp(-d_yy / denom).masked_fill(eye_y, 0.0).sum()
+    n_bw = len(bandwidths)
+    surrogate = (2.0 * s_xx / (m * (m - 1)) - 2.0 * s_xy / (m * n)) / n_bw
+    with torch.no_grad():
+        tot = all_sum(torch.stack([s_xx.detach(), s_xy.detach(), s_yy]).double())
+        value = (tot[0] / (m * (m - 1)) + tot[2] / (n * (n - 1))
+                 - 2.0 * tot[1] / (m * n)) / n_bw
+    return value.float(), surrogate
+
+
 def _offdiag_dist(d, eps, beta=1.0):
     """||.||^beta from squared distances, with the diagonal (self-pairs) set to 0 and
     cut out of the graph BEFORE the power: d_ii is 0 only up to rounding, and
@@ -309,6 +391,18 @@ class GaussianFlowMMD(GaussianFlowDagger):
             live on different scales). Costs two extra backward passes per iteration;
             for smoke runs, not for training. Uses ``autograd.grad``, which does not
             touch ``.grad`` and so does not fire DDP's reducer hooks.
+        mmd_chunk (int | None): the large-batch path, where ``mmd_batch`` (per rank)
+            may exceed the micro-batch. The pooled MMD is scored with the kernel
+            rows sharded across ranks (:func:`mmd2_rbf_sharded`), its exact gradient
+            w.r.t. every band state is taken on detached copies, and that gradient
+            is backpropagated into the weights inside forward_train. With
+            ``mmd_chunk >= mmd_batch`` the band is rolled out ONCE with its graph
+            kept and backpropagated in one pass. Smaller values trade compute for
+            memory: the band is rolled out without a graph, then REPLAYED in chunks
+            of this size with a graph, so only one chunk's graph is ever alive, at
+            the cost of one extra no-grad rollout. Same gradient either way. See
+            :meth:`_mmd_chunked_step` for the conditions this needs. None = the
+            single-graph path.
     """
 
     def __init__(self,
@@ -339,6 +433,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
                  mmd_gather=True,
                  mmd_grad_probe=False,
                  mmd_target_share='none',
+                 mmd_chunk=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         assert mmd_feature in ('subspace', 'raw', 'both')
@@ -492,6 +587,24 @@ class GaussianFlowMMD(GaussianFlowDagger):
             'probe with mmd_step_checkpoint=False (and a small mmd_batch, or it will '
             'not fit).')
         self.mmd_grad_probe = mmd_grad_probe
+        self.mmd_chunk = None if mmd_chunk is None else int(mmd_chunk)
+        if self.mmd_chunk is not None:
+            assert self.mmd_chunk >= 1
+            # mmd_batch exceeds the micro-batch here, so the rollout labels cannot be
+            # the rows' own and the targets cannot be the rows: both come from the
+            # restricted class draw and from disk
+            assert mmd_classes_per_batch is not None and mmd_target_n is not None, (
+                'mmd_chunk needs mmd_classes_per_batch and mmd_target_n.')
+            assert mmd_width == 'mean' and mmd_unbiased, (
+                "mmd_chunk scores with mmd2_rbf_sharded: width='mean', unbiased only.")
+            assert not mmd_step_checkpoint and not mmd_grad_probe
+            # the extra backward passes run inside forward_train; they are only safe
+            # on a micro-batch under DDP no_sync, i.e. not the last one -- see
+            # _mmd_chunked_step
+            assert self.mmd_accum_steps >= 2, (
+                'mmd_chunk backpropagates inside forward_train, which is only safe on '
+                'a micro-batch DDP is not syncing: set train_cfg.grad_accum_batch_size '
+                'so there are >= 2 micro-batches (and mmd_accum_steps to match).')
 
     # ---- band rollout -------------------------------------------------------
 
@@ -581,13 +694,15 @@ class GaussianFlowMMD(GaussianFlowDagger):
             return fn(x_t)
         return torch.utils.checkpoint.checkpoint(fn, x_t, use_reentrant=False)
 
-    def _band_rollout(self, x_ref, class_labels, t_split, include_start=False):
+    def _band_rollout(self, x_ref, class_labels, t_split, include_start=False, noise=None):
         """Roll out from noise with the current policy for exactly the solver steps
         that stay inside the band, keeping the graph. Returns ``[(sigma, x_sigma),
         ...]`` for the states INSIDE the band (the sigma=1 start is excluded: both
         distributions are exactly N(0, I) there, so its MMD is identically 0).
         ``include_start=True`` prepends that start as ``states[0]``, for per-point
         terms that do have a target at t=1 (GaussianFlowOnPolicy.cfg_gap_start).
+        ``noise`` fixes the initial noise (default: fresh, shaped like ``x_ref``), so
+        a trajectory can be replayed exactly (see :meth:`_mmd_chunked_step`).
 
         The Heun scheduler is stepped exactly as in ``forward_test`` -- two network
         evals per step (predictor at sigma_k, corrector at sigma_{k+1}) -- so the
@@ -618,7 +733,9 @@ class GaussianFlowMMD(GaussianFlowDagger):
             f'mmd_t_split={t_split} leaves no solver step inside the band at '
             f'mmd_nfe={self.mmd_nfe} (first landing sigma is {float(grid[2]):.4f}).')
 
-        x_t = (timesteps[0] / self.num_timesteps) * torch.randn_like(x_ref)
+        if noise is None:
+            noise = torch.randn_like(x_ref)
+        x_t = (timesteps[0] / self.num_timesteps) * noise
         states = [(float(grid[0]), x_t)] if include_start else []   # pure noise, no graph
         i = 0
         for step in range(n_band):
@@ -928,6 +1045,141 @@ class GaussianFlowMMD(GaussianFlowDagger):
         log_vars['mmd_n'] = loss.new_tensor(float(n_pooled) * self.mmd_accum_steps)
         return loss, log_vars
 
+    def _mmd_chunked_step(self, x_0, labels, t_split, noise=None):
+        """The MMD term under ``mmd_chunk``: score the pooled MMD on detached states,
+        then backpropagate its state gradients. Returns log_vars; the gradient is
+        already in ``.grad`` when it returns.
+
+        1. Roll the band out for all ``m = labels.numel()`` trajectories from
+           ``noise``. With ``mmd_chunk >= m`` (single pass) the graph is KEPT; else it
+           is rolled out without a graph, ``mmd_chunk`` at a time, for replay in 3.
+        2. At every band state, the pooled MMD^2 against a class-matched target set
+           (:func:`mmd2_rbf_sharded`) and its gradient g_k w.r.t. this rank's states,
+           taken on detached copies so the kernel's graph never joins the band's.
+        3. Backpropagate sum_k <g_k, x_k>. MMD^2 depends on the weights only through
+           the states, so by the chain rule this is exactly d(mean_k MMD^2_k)/d(theta).
+           Single pass: one backward through the graph kept in 1. Replay: the band is
+           re-run chunk by chunk WITH a graph -- same noise, labels and chunk
+           boundaries, eval mode, so the states are step 1's -- one backward per
+           chunk; the chunks' parameter gradients sum to the same total.
+
+        The backward passes run HERE, inside forward_train, accumulating straight into
+        ``.grad``; nothing is added to the returned loss. That is only safe on a
+        micro-batch DDP is not syncing -- train_grad_accum wraps every micro-batch but
+        the last in no_sync, and under sync each backward would fire the reducer. The
+        iteration latch hands the MMD to the FIRST micro-batch and __init__ asserts
+        mmd_accum_steps >= 2, so that holds. It also assumes no fp16 loss scaler (these
+        runs train in bf16 without one). forward_train calls this BEFORE the
+        flow-matching forward, so the FM graph and a band graph are never alive at once.
+
+        Scaling matches :meth:`_mmd_score`: *mmd_weight, /n_steps (mean over the band),
+        *mmd_accum_steps (cancels train_grad_accum's 1/N) and *world_size (cancels
+        DDP's averaging of per-rank gradients that SUM to the pooled one). Logs the
+        same keys as :meth:`_mmd_score`, plus per-phase timings and, under replay,
+        ``mmd_replay_err``: the largest deviation of a replayed final state from its
+        step-1 value, relative to the state's RMS. It should sit near 0; a large value
+        means the replay is not reproducing the trajectories that were scored.
+        """
+        m = labels.numel()
+        dev = x_0.device
+        acc = float(self.mmd_accum_steps)
+        world_size = dist.get_world_size() if (
+            self.mmd_gather and dist.is_available() and dist.is_initialized()) else 1
+        train_spaces = ('subspace', 'raw') if self.mmd_feature == 'both' \
+            else (self.mmd_feature, )
+        if noise is None:
+            noise = torch.randn((m, ) + tuple(x_0.shape[1:]), device=dev, dtype=x_0.dtype)
+        chunks = [slice(i, min(i + self.mmd_chunk, m)) for i in range(0, m, self.mmd_chunk)]
+        replay = len(chunks) > 1
+
+        def clock():
+            torch.cuda.synchronize(dev)
+            return time.perf_counter()
+
+        # 1. the band for every trajectory: graph kept for a single pass, none if it
+        #    is replayed in 3
+        t0 = clock()
+        with torch.no_grad() if replay else contextlib.nullcontext():
+            runs = [self._band_rollout(noise[c], labels[c], t_split, noise=noise[c])
+                    for c in chunks]
+        sigmas = [s for s, _ in runs[0]]
+        states = [torch.cat([r[k][1] for r in runs], dim=0) if replay else runs[0][k][1]
+                  for k in range(len(sigmas))]
+        del runs
+        x_last = states[-1] if replay else None   # kept for the replay check
+        t1 = clock()
+
+        # 2. pooled MMD^2 at every state, and its gradient w.r.t. this rank's states
+        per_row = self._target_per_row(m, rows_match=False)
+        shared = None
+        if self.mmd_target_share != 'none':
+            with torch.no_grad():
+                x1_s = self._draw_target_latents([int(c) for c in labels], per_row, dev)
+            shared = (x1_s,
+                      torch.randn_like(x1_s) if self.mmd_target_share == 'both' else None)
+        per_space = dict(subspace=[], raw=[])
+        grads = []
+        for k, sigma in enumerate(sigmas):
+            x_tgt = self._target_latents(x_0, sigma, labels, per_row, shared)
+            x_k = states[k].detach().requires_grad_(True)
+            if replay:
+                states[k] = None   # only its gradient is needed from here on
+            surrogate = 0.0
+            for space in ('subspace', 'raw'):
+                train = space in train_spaces
+                with contextlib.nullcontext() if train else torch.no_grad():
+                    val, sur = mmd2_rbf_sharded(
+                        self._mmd_feats(x_k, space), self._mmd_feats(x_tgt, space),
+                        bandwidths=self.mmd_bandwidths)
+                per_space[space].append(val)
+                if train:
+                    surrogate = surrogate + sur
+            grads.append(torch.autograd.grad(surrogate, x_k)[0])
+            del x_tgt, x_k, surrogate, sur
+        del shared
+        t2 = clock()
+
+        # 3. backpropagate the state gradients: through the kept graph in one pass,
+        #    or by replaying the band with a graph, chunk by chunk
+        scale = self.mmd_weight * acc * world_size / max(len(sigmas), 1)
+        replay_err = torch.zeros((), device=dev)
+        if not replay:
+            torch.autograd.backward(states, [g.mul_(scale) for g in grads])
+            del states
+        for c in (chunks if replay else []):
+            run = self._band_rollout(noise[c], labels[c], t_split, noise=noise[c])
+            sur = sum((g[c].to(x.dtype) * x).sum() for g, (_, x) in zip(grads, run))
+            with torch.no_grad():
+                ref = x_last[c].float()
+                err = (run[-1][1].detach().float() - ref).abs().max() \
+                    / ref.pow(2).mean().sqrt().clamp_min(1e-12)
+                replay_err = torch.maximum(replay_err, err)
+            (sur * scale).backward()
+            del run, sur
+        t3 = clock()
+
+        log_vars = dict()
+        for space, vals in per_space.items():
+            tag = 'mmd_sub' if space == 'subspace' else 'mmd_raw'
+            log_vars[tag] = torch.stack(vals).mean() * acc
+            if space in train_spaces:   # per-step detail for the trained space only
+                for sigma, v in zip(sigmas, vals):
+                    log_vars[f'{tag}_s{sigma:.3f}'] = v * acc
+        trained = sum(torch.stack(per_space[s]).mean() for s in train_spaces)
+        # same reading as the single-graph path's loss_mmd (weight * MMD^2 * world_size)
+        log_vars['loss_mmd'] = self.mmd_weight * trained * world_size * acc
+        new = replay_err.new_tensor
+        log_vars['mmd_classes'] = new(float(len(set(labels.tolist()))) * acc)
+        log_vars['mmd_steps'] = new(float(len(sigmas)) * acc)
+        log_vars['mmd_n'] = new(float(m * world_size) * acc)
+        log_vars['mmd_n_tgt'] = new(float(per_row * m * world_size) * acc)
+        if replay:
+            log_vars['mmd_replay_err'] = replay_err * acc
+        log_vars['mmd_t_roll'] = new((t1 - t0) * acc)
+        log_vars['mmd_t_score'] = new((t2 - t1) * acc)
+        log_vars['mmd_t_bwd'] = new((t3 - t2) * acc)
+        return log_vars
+
     def _mmd_due(self, running_status):
         """Whether this ITERATION should carry the MMD term. Pure predicate -- no
         side effects, so it is safe to ask more than once per step."""
@@ -1000,17 +1252,26 @@ class GaussianFlowMMD(GaussianFlowDagger):
         if run_mmd:
             mmd_labels = class_labels_true if class_labels_true is not None \
                 else kwargs['class_labels']
+            # under mmd_chunk the rollout count is not tied to the micro-batch
+            m = self.mmd_batch if self.mmd_chunk is not None \
+                else min(self.mmd_batch, x_0.size(0))
             if self.mmd_classes_per_batch is not None:
                 # drawn ONCE here and reused below: a second draw would prefetch one
                 # class set and then score a different one
-                mmd_labels = self._draw_restricted_labels(
-                    min(self.mmd_batch, x_0.size(0)), x_0.device)
+                mmd_labels = self._draw_restricted_labels(m, x_0.device)
                 rows_match = False   # the rows' images are of OTHER classes now
-            m = min(self.mmd_batch, x_0.size(0))
             per_row = self._target_per_row(m, rows_match)
             if per_row is not None:   # target drawn from disk -> prefetch it
                 self._prefetch_targets(mmd_labels[:m], per_row,
                                        self._n_target_draws(x_0, t_split))
+
+        chunked_log_vars = None
+        if run_mmd and self.mmd_chunk is not None:
+            # scored AND backpropagated here, before the flow-matching forward, so the
+            # two graphs never coexist; nothing is added to the loss below
+            chunked_log_vars = self._mmd_chunked_step(x_0, mmd_labels, t_split)
+            self._drop_pending()
+            run_mmd = False
 
         loss, log_vars = super().forward_train(
             x_0,
@@ -1028,6 +1289,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
             'policy\'s CURRENT marginals, so a replay buffer of stale rollout states '
             'has no place in it. Got a buffer_batch -- drop the DaggerRolloutHook '
             '(and set expert=None).')
+        if chunked_log_vars is not None:
+            log_vars.update(chunked_log_vars)
         if run_mmd:
             # CONDITIONAL-ONLY rollouts: use the UNDROPPED labels. kwargs['class_labels']
             # has had CFG dropout applied, so ~10% of trajectories would be generated

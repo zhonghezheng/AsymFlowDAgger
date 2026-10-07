@@ -35,7 +35,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
 
         where ``v`` is the model's velocity and ``v*`` the DATA-derived empirical
         velocity of the ground-truth model. The model's two branches come from one
-        batched forward of ``2 * band_batch`` rows (true labels | null). The target
+        batched forward of ``2 * band_rows`` rows (true labels | null). The target
         is the empirical expert's gap at the same state: its class-restricted
         posterior mean gives ``v*_cond`` and its whole-dataset posterior mean gives
         ``v*_uncond``, both mapped through ``expert_target`` into the same
@@ -69,6 +69,20 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         the noised on-path marginal (see :class:`GaussianFlowMMD`). Off by default
         (``mmd_weight=0``).
 
+    Loss composition, as in d-flow (and DAGGER's proportional carve): the FM loss is
+    ONE mean over the step's batch ``B``, and emp_fm's rows are part of it. A band
+    iteration takes ``n_exp = round(p_high (1 - f) B)`` expert rows (``band_rows``)
+    out of the micro-batch that runs the band; the on-path rows left stop at the band
+    edge apart from ``round(p_high f mb)`` real-data rows inside it (``f`` =
+    ``band_frac_on_path``, ``p_high = P(sigma >= t_split)`` under the uniform
+    timestep sampler). Every row then weighs ``1/B``: the row counts carry reg_ft's
+    sigma allocation, the flow loss's per-row logit-normal weight turns it into
+    reg_ft's mass, and no per-term mass factor is needed. Rollout rows sit on the
+    solver grid, so their weight is their grid cell's average, not the value at the
+    state (see :meth:`_band_grid`). The CFG gap and MMD stay separate terms with
+    their own weights. An iteration without a band (warmup, ``mmd_interval``) is
+    plain full-range reg_ft.
+
     Gradient structure, which differs between the two on purpose:
 
       * the CFG-gap term is a per-point regression at *fixed* visited states, so the
@@ -93,29 +107,19 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
 
     Args:
         cfg_gap_weight (float): coefficient on the mean-over-band gap-matching loss.
-            0 disables the term. The mean is over elements and band steps, with no
-            logit-normal reweighting -- the band is a narrow sigma range, so the
-            per-sigma weight would be near-constant across it anyway, and a plain
-            mean keeps the knob's scale readable against the logged value.
-        cfg_gap_max_states (int | None): evaluate the point terms (gap and fm, which
-            share a forward) at this many band states
-            per iteration, drawn uniformly at random from the band (``None`` = all of
-            them). This is the term's MEMORY knob: every scored state holds its own
-            ``2 * band_batch``-row forward graph until backward, so all 6 states of a
-            0.875 band at ``band_batch=64`` retain ~768 rows of activations -- several
-            times the bs=256 flow-matching step. Subsampling is unbiased over
-            iterations (the states are drawn uniformly, so each is visited equally
-            often in expectation), it only makes the per-iteration estimate noisier.
-            The rollout itself still runs the whole band -- it has to, to reach the
-            band edge -- so this trades gradient variance for activations, not evals.
-        emp_fm_weight (float | str): coefficient on the empirical FM term. 0 disables
-            it. ``'mass'`` sets it to ``p_high = P(sigma >= t_split)`` so the band
-            carries exactly the sigma mass it does in reg_ft, matching the on-path
-            term's ``p_low`` factor -- see the note in __init__.
-            Unlike the gap, this one goes through ``self.flow_loss`` (logit-normal
-            rescale and the 0.5 factor included), so the logged ``emp_fm`` is directly
-            comparable to the DAGGER arms' ``loss_dagger`` -- and is much smaller than
-            a raw MSE at these sigmas, where that reweighting down-weights hard.
+            0 disables the term. The mean is over elements and band rows, with no
+            logit-normal reweighting unless ``cfg_gap_reweight`` -- a plain mean
+            keeps the knob's scale readable against the logged value, but note the
+            weight is far from constant across the band (0.82 at sigma 0.92, 0.015
+            at 0.98), so the two choices emphasise different ends of it.
+        emp_fm_weight (float): per-row multiplier on the empirical FM rows inside the
+            shared FM mean (see "Loss composition"). 1 (default) = parity: an expert
+            row weighs exactly what the on-path row it replaced would have. 0
+            disables the term (and the carve). Unlike the gap, its rows take
+            ``self.flow_loss``'s per-row value (logit-normal rescale and the 0.5
+            factor included), so the logged per-row ``emp_fm`` is directly comparable
+            to the DAGGER arms' ``loss_dagger`` -- and is much smaller than a raw MSE
+            at these sigmas, where that reweighting down-weights hard.
         cfg_gap_target (str): ``'expert'`` (default) matches the data-derived gap
             ``v*_cond - v*_uncond``; ``'zero'`` is the expert-free ablation that
             drives the model's own gap to zero.
@@ -128,32 +132,30 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             is what the wrapper's ``negative_labels`` carries.
         band_t_split (float | None): band lower edge. ``None`` falls back to
             ``mmd_t_split``, then to ``t_split``.
-        band_nfe (int | None), band_batch (int | None), band_sampler (str | None):
-            rollout grid / width / scheduler. ``None`` keeps the inherited
-            ``mmd_nfe`` / ``mmd_batch`` / ``mmd_sampler``. One band, one rollout:
-            both terms read the same states, so these override the MMD names rather
-            than sitting beside them.
-        band_score_start (bool): also score the point terms (CFG gap, alignment,
+        band_nfe (int | None), band_sampler (str | None): rollout grid /
+            scheduler. ``None`` keeps the inherited ``mmd_nfe`` / ``mmd_sampler``.
+            One band, one rollout: every term reads the same states, so these
+            override the MMD names rather than sitting beside them.
+        band_rows (int | str): how many rows the point terms score per band, ONE
+            per trajectory: the band rolls out exactly this many trajectories
+            (plus the t=1-only ones of ``band_score_start``) and scores each at one
+            band state drawn uniformly, so no two rows share a trajectory and no
+            rollout goes unscored. Each row costs one bank. ``'auto'`` = the expert's
+            row share of the step's batch, ``round(p_high * (1 - band_frac_on_path)
+            * batch)`` (``round(p_high * batch)`` with emp_fm off, where the rows
+            serve the gap / MMD alone). An explicit count changes the band's share
+            of the FM mean with it.
+        band_score_start (bool): also score the point terms (CFG gap and
             emp_fm) at the t=1 START state of the rollout (pure noise -- inference's
             first eval), not only at the landing states. The gap has a real target
             there: the expert's softmax is flat at t=1, so v*_c - v*_u = x0_u - x0_c,
             the class-mean offset. Start rows are added at the same per-state share as
-            each landing state (round(band_rows / n_states)) and drawn from
-            trajectories that already get banks, so they cost no image IO. emp_fm's
-            logit-normal weight at t=1 is ~1e-52, so its start rows add ~nothing but
-            count in its per-row mean. Only MMD leaves the start out -- both of its
-            sides are exactly N(0, I) there, so the statistic is identically 0.
-            Default False.
-        band_one_per_traj (bool): ONE scored point per trajectory. The rollout width
-            becomes the row count (``band_rows``; ``band_batch`` is ignored) and each
-            trajectory is scored at one band state drawn uniformly, so no two rows
-            share a trajectory and no rollout goes unscored. The t=1 rows of
-            ``band_score_start`` then sit on trajectories of their OWN -- fresh noise,
-            which needs no rollout since the start is their only scored state -- at
-            the cost of one bank per row (``band_rows`` + start rows) instead of the
-            ~0.65 * band_batch distinct trajectories the independent draw hits.
-            Default True; False restores independent (trajectory, state) draws with
-            replacement over ``band_batch`` rollouts.
+            each landing state (round(band_rows / n_states)), each on a trajectory of
+            its OWN -- fresh noise, never rolled out, since the start is its only
+            scored state -- so each costs one bank. emp_fm leaves them out: they
+            are not carved rows, and its logit-normal weight at t=1 is ~1e-52
+            anyway. MMD leaves the start out too -- both of its sides are exactly
+            N(0, I) there, so the statistic is identically 0. Default False.
         band_states (str): where the band's scored states come from. ``'rollout'``
             (default) -- the current policy's Heun rollout, as described above.
             ``'onpath'`` -- NO rollout: each row is a real image noised to a
@@ -165,7 +167,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             under 'prior' class sampling), and BOTH orientations of it are left out
             of that row's conditional posterior. Without that the posterior at
             sigma >= 0.88 collapses onto x0 itself and v* reduces to eps - x0, i.e.
-            to reg_ft. Needs band_one_per_traj and the u8 bank storage; MMD and
+            to reg_ft. Needs the u8 bank storage; MMD and
             band_score_start have no meaning without a rollout and are refused.
         band_onpath_keep (bool): ``'onpath'`` only -- KEEP each row's image in its
             posteriors instead of leaving it out: no exclusion in the class bank, and
@@ -174,9 +176,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             sigma <~ 0.94 it is eps - x0 to within float error). Default False.
         cfg_gap_reweight (bool): weight the CFG gap per row by the flow loss's own
             sigma weight (0.5 * its rescale -- the pretraining logit-normal mass),
-            exactly as emp_fm and the on-path FM are, instead of a plain mean. Under
-            the logit-normal(0.8, 0.8) weight the rows at 0.98 / t=1 then carry ~0.015
-            / ~0. The unweighted value is still logged as cfg_gap_raw. Default False.
+            exactly as emp_fm and the on-path FM are (cell-averaged on grid rows),
+            instead of a plain mean. Under the logit-normal(0.8, 0.8) weight the
+            rows at 0.98 / t=1 then carry ~0.003 / ~0. The unweighted value is still
+            logged as cfg_gap_raw. Default False.
     """
 
     def __init__(self,
@@ -184,27 +187,21 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                  cfg_gap_weight=1.0,
                  cfg_gap_target='expert',
                  emp_fm_weight=1.0,
-                 cfg_gap_max_states=None,
                  cfg_gap_detach_uncond=False,
                  null_label=None,
-                 cfg_align_weight=0.0,
                  band_prob_class=0.9,
-                 cfg_complement_mode=None,
                  emp_fm_complement_mode=None,
                  band_null_from_batch=False,
                  band_frac_on_path=0.5,
                  allow_no_band_term=False,
                  onpath_truncate='auto',
-                 onpath_truncate_rescale=True,
                  band_t_split=None,
                  band_nfe=None,
-                 band_batch=None,
                  band_rows='auto',
                  band_class_sampling='uniform',
                  band_classes_per_batch=None,
                  band_sampler=None,
                  band_score_start=False,
-                 band_one_per_traj=True,
                  band_states='rollout',
                  band_onpath_keep=False,
                  cfg_gap_reweight=False,
@@ -214,11 +211,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         self.cfg_gap_weight = float(cfg_gap_weight)
         assert cfg_gap_target in ('expert', 'zero')
         self.cfg_gap_target = cfg_gap_target
-        # 'mass' is resolved below, once the band edge is known.
-        self.emp_fm_weight = emp_fm_weight if emp_fm_weight == 'mass' \
-            else float(emp_fm_weight)
-        self.cfg_gap_max_states = None if cfg_gap_max_states is None \
-            else int(cfg_gap_max_states)
+        assert emp_fm_weight != 'mass', (
+            "emp_fm_weight='mass' is gone: the band's sigma mass now comes from its ROW "
+            'count in the shared FM mean (see "Loss composition"), so 1.0 is parity.')
+        self.emp_fm_weight = float(emp_fm_weight)
         self.cfg_gap_detach_uncond = cfg_gap_detach_uncond
         self.null_label = int(null_label) if null_label is not None \
             else int(self.denoising.num_classes)
@@ -228,29 +224,18 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             self.mmd_t_split = band_t_split
         if band_nfe is not None:
             self.mmd_nfe = int(band_nfe)
-        # 'auto' derives the trajectory count from the band's point budget at runtime
-        # (see _band_traj_count) instead of pinning it; an int pins it as before.
-        # band_rows: how many (trajectory, band-time) PAIRS the point terms score.
-        # Decoupled from band_batch (how many trajectories are rolled out) exactly as
-        # d-flow decouples n_band_roll from n_roll: rows are free, trajectories cost a
-        # bank each, so lowering band_batch alone cuts IO without shrinking the band's
-        # share of the objective.
+        # band_rows: how many rows the point terms score, one per trajectory (see
+        # _draw_band_plan) -- so it is also the rollout width and the bank count.
         self.band_rows = band_rows
-        self.band_batch_auto = isinstance(band_batch, str) and band_batch == 'auto'
-        if band_batch is not None and not self.band_batch_auto:
-            self.mmd_batch = int(band_batch)
         if band_sampler is not None:
             self.mmd_sampler = band_sampler
         self.band_score_start = bool(band_score_start)
-        self.band_one_per_traj = bool(band_one_per_traj)
         assert band_states in ('rollout', 'onpath'), band_states
         self.band_states = band_states
         assert not band_onpath_keep or band_states == 'onpath', \
             "band_onpath_keep only applies to band_states='onpath'."
         self.band_onpath_keep = bool(band_onpath_keep)
         if band_states == 'onpath':
-            assert self.band_one_per_traj, \
-                "band_states='onpath' needs band_one_per_traj (one bank per row)."
             assert self.mmd_weight == 0 and not self.band_score_start, (
                 "band_states='onpath' has no rollout: MMD and band_score_start (the "
                 'rollout start state) do not apply.')
@@ -263,17 +248,6 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # emp_fm is on (True/False force it), mirroring the DAGGER arms' t_split
         # carve; the inherited _sample_t_below_split reads self.t_split, so the band
         # edge is copied there.
-        # ALIGNMENT term -- an alternative to the full gap. Writing
-        # a = v_cond - v*_cond, b = v_uncond - v*_uncond, this adds
-        #     - cfg_align_weight * mean_rows <a/||a||, b/||b||>
-        # i.e. it rewards the two branches' residuals POINTING the same way while
-        # saying nothing about their size. The gap ||a - b||^2 = ||a||^2 + ||b||^2 -
-        # 2<a,b> couples direction and magnitude together; the cosine isolates the
-        # direction half, is scale free, and is bounded in [-w, w] -- so unlike a raw
-        # <a,b> reward it cannot be gamed by making both branches enormously wrong in
-        # the same direction. Magnitudes stay pinned by emp_fm and the on-path FM
-        # loss. Use INSTEAD of cfg_gap_weight (set that to 0), or alongside it.
-        self.cfg_align_weight = float(cfg_align_weight)
         # CFG dropout for the band's empirical-FM term: each on-policy point is
         # regressed onto ONE branch's expert velocity -- the conditional one with
         # probability band_prob_class, the unconditional one otherwise. This mirrors
@@ -285,15 +259,15 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # against itself and contribute an exact zero.
         assert 0.0 <= band_prob_class <= 1.0
         self.band_prob_class = float(band_prob_class)
-        # Fraction of the BAND's sigma mass supervised by REAL data (on-path FM with
-        # the true velocity) rather than by the expert at on-policy states -- DAGGER's
-        # frac_on_path, which the buffer-free arms previously could not apply because
-        # it is consumed in the wrapper's buffer carve. Without it the band has no
-        # ground-truth anchor at all and v* (a smoothed bank average) owns the region
-        # outright, which is a plausible driver of the mode narrowing those runs showed.
-        # Both band terms keep BOTH halves of the target -- subspace AND complement --
-        # always. What these select is how the COMPLEMENT is computed, independently
-        # per term (None -> inherit diffusion.complement_mode):
+        # band_frac_on_path: fraction of the BAND's rows that are REAL data (on-path FM
+        # with the true velocity) rather than expert rows at on-policy states --
+        # DAGGER's frac_on_path, applied the same way, as a row split of the carve
+        # (see _carve_counts). Without it the band has no ground-truth anchor at all
+        # and v* (a smoothed bank average) owns the region outright, which is a
+        # plausible driver of the mode narrowing those runs showed.
+        # emp_fm keeps BOTH halves of its target -- subspace AND complement --
+        # always. emp_fm_complement_mode selects how the COMPLEMENT is computed
+        # (None -> inherit diffusion.complement_mode):
         #
         #   'full'    : the complement of the plain velocity toward x0_hat,
         #               P_perp((x_t - x0_hat)/sigma_c). The form the network's
@@ -305,11 +279,12 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         #               cancelling its own hard-wired x_t_comp term.
         #
         # 'project' on the DAGGER regression target diverged badly once (loss_dagger
-        # stuck at 0.73, FID 4.32 -> 294.6), but that was the full-batch expert loss;
-        # for the CFG gap the substituted term largely cancels in the difference
-        # (the two branches share the same form, leaving -cc*P_perp(Delta)), so the
-        # two modes differ there by a factor of sigma on the complement alone.
-        self.cfg_complement_mode = cfg_complement_mode
+        # stuck at 0.73, FID 4.32 -> 294.6).
+        #
+        # The CFG gap has no such option: it is always 'full', the assembled velocity
+        # space self.pred() returns (expert_target('full') is the assembled image of
+        # the derived empirical asym target). There x_t cancels between the branches,
+        # so the target gap is exactly (x0_hat_uncond - x0_hat_cond) / sigma_c.
         self.emp_fm_complement_mode = emp_fm_complement_mode
         # Draw the null bank from the batch's own classes rather than the whole
         # dataset. See EmpiricalExpert.build_banks for why this is off by default;
@@ -319,8 +294,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         self._bank_pending = None   # in-flight bank draw for THIS iteration
         self._bank_ready = None     # (plan, future) prefetched for the NEXT band
         self._band_t = {}           # this band's timings / bank costs, see _log_bank_cost
-        self._n_states_key = None   # cache for _n_band_states
-        self._n_states = None
+        self._grid_key = None       # cache for _band_grid
+        self._grid = None
         # How the rollout's classes are drawn. 'batch' reuses the minibatch's labels
         # (what this arm did before); 'uniform'/'prior' draw them INDEPENDENTLY of the
         # batch, which is what the buffered DAGGER hook did and what makes real
@@ -348,7 +323,6 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         self.allow_no_band_term = bool(allow_no_band_term)
         assert onpath_truncate in ('auto', True, False)
         self.onpath_truncate = onpath_truncate
-        self.onpath_truncate_rescale = bool(onpath_truncate_rescale)
         if self._truncate_onpath():
             assert self.mmd_t_split is not None, (
                 'onpath_truncate needs a band edge: set band_t_split (or '
@@ -360,36 +334,16 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         assert self.band_states != 'onpath' or self._truncate_onpath(), (
             "band_states='onpath' needs the on-path FM truncated at the band edge "
             "(onpath_truncate True, or 'auto' with emp_fm on).")
-        if self.emp_fm_weight == 'mass':
-            # MASS MATCHING, applied to the BAND term only. Both FM terms already
-            # share self.flow_loss, so they sit on the same per-point footing; what
-            # differs is how much of the sigma axis each speaks for. The band covers
-            # only sigma >= t_split, so it carries p_high = P(sigma >= t_split) --
-            # at t_split=0.9, ~0.1. Left at 1.0 the band would contribute ten times
-            # its share and would dominate the objective.
-            #
-            # The on-path term carries the matching p_low = P(sigma < t_split)
-            # factor (onpath_truncate_rescale), so the two FM terms together
-            # reproduce reg_ft's sigma allocation exactly, with v* substituted as the
-            # target inside the band:
-            #     p_low * mean_{sigma<t}[w L_onpath] + p_high * mean_band[w L_emp]
-            # Same invariant the DAGGER arms get from roll_weight='proportional'
-            # (w = n_roll/bs), which makes their combined loss one per-point mean over
-            # the whole batch. The CFG-gap / alignment terms are NOT part of this
-            # normalisation -- they carry their own weights, unscaled.
-            # Estimated from the model's OWN timestep_sampler, so it stays correct if
-            # the sampling distribution is ever changed away from uniform.
-            assert self.t_split is not None, (
-                "emp_fm_weight='mass' needs a band edge to measure against; set "
-                'band_t_split (and leave onpath_truncate on).')
-            # the band's mass MINUS the share handed back to real data
-            self.emp_fm_weight = self.high_sigma_fraction() * (1.0 - self.band_frac_on_path)
+        # the carve takes its expert rows out of the micro-batch the FM loss runs on,
+        # so emp_fm needs the on-path rows to stop at the band edge to make room
+        assert self.emp_fm_weight == 0 or self._truncate_onpath(), (
+            'emp_fm needs onpath_truncate on: its rows replace the band share of the '
+            'on-path batch, which must therefore stop at the band edge.')
         # NB the expert's presence is NOT checked here: the wrapper attaches the
         # handle (_dagger_expert) after the diffusion is constructed, so the check
         # lives in _build_gap_banks, at first use.
         assert (self.cfg_gap_weight != 0 or self.emp_fm_weight != 0
-                or self.mmd_weight != 0 or self.cfg_align_weight != 0
-                or self.allow_no_band_term), (
+                or self.mmd_weight != 0 or self.allow_no_band_term), (
             'GaussianFlowOnPolicy with cfg_gap_weight, emp_fm_weight and mmd_weight '
             'all 0 has no on-policy term at all -- that is plain reg_ft, so use '
             'GaussianFlow (or the regft config) instead of paying for the band '
@@ -481,10 +435,14 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         MSE times this, averaged over rows, is exactly flow_loss's value."""
         return self.flow_loss.rescale_fn(torch.full_like(t, 0.5), t)
 
-    def _band_point_losses(self, x_s, sigma, labels, banks=None, exclude=None):
+    def _band_point_losses(self, x_s, sigma, labels, banks=None, exclude=None,
+                           row_w=None):
         """Both on-policy point terms at ONE visited state, sharing one model forward
-        and one expert evaluation. Returns ``(gap, fm)``; ``fm`` is ``None`` when the
-        empirical FM term is off.
+        and one expert evaluation. Returns ``(gap, fm_rows)``: ``fm_rows`` holds each
+        row's flow-loss value (``None`` when the empirical FM term is off), for the
+        caller to SUM into the shared FM mean. ``row_w`` multiplies the flow loss's
+        per-row sigma weight (the grid rows' cell correction, see :meth:`_band_grid`)
+        wherever that weight is used.
 
         The model's two branches come from a single batched forward over ``[x_s; x_s]``
         with ``[labels; null]``, so the pair is evaluated under identical activations
@@ -509,11 +467,12 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         pins the absolute level. Together they fix both.
 
         NB the two use DIFFERENT weightings on purpose: gap is a plain mean (its
-        scale stays readable against cfg_gap_weight), while fm goes through
-        ``self.flow_loss`` -- logit-normal rescale and the 0.5 factor included -- so
-        the logged value is directly comparable to the DAGGER arms' loss_dagger.
-        That reweighting is a strong down-weight at these sigmas, so expect fm to log
-        much smaller than a raw MSE would.
+        scale stays readable against cfg_gap_weight), while fm takes ``self.flow_loss``'s
+        per-row value -- logit-normal rescale and the 0.5 factor included -- so a band
+        row weighs exactly what an on-path row at the same sigma does, and the logged
+        value is directly comparable to the DAGGER arms' loss_dagger. That reweighting
+        is a strong down-weight at these sigmas, so expect fm to log much smaller than
+        a raw MSE would.
         """
         m = x_s.size(0)
         # sigma may be a scalar (one state for the whole batch) or a per-ROW tensor
@@ -521,6 +480,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         sig_vec = sigma.to(x_s).reshape(m) if torch.is_tensor(sigma) \
             else x_s.new_full((m, ), float(sigma))
         t = sig_vec * self.num_timesteps
+        # the flow loss's per-row sigma weight, cell-corrected on grid rows
+        row_lw = self._loss_row_weights(t)
+        if row_w is not None:
+            row_lw = row_lw * row_w.to(row_lw)
         both = torch.cat([x_s, x_s], dim=0)
         cond_null = torch.cat(
             [labels, torch.full_like(labels, self.null_label)], dim=0)
@@ -533,15 +496,14 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         vs_cond = vs_uncond = vs_fm_c = vs_fm_u = None
         if banks is not None:
             x0_c, x0_u = self._expert_velocities(x_s, sig_vec, labels, banks, exclude)
-            # the CFG gap and emp_fm each get their own complement treatment
-            vs_cond = self.expert_target(x_s, sig_vec, x0_c, mode=self.cfg_complement_mode)
-            vs_uncond = self.expert_target(x_s, sig_vec, x0_u, mode=self.cfg_complement_mode)
+            # the CFG gap is always 'full'; emp_fm takes its own complement treatment
+            vs_cond = self.expert_target(x_s, sig_vec, x0_c, mode='full')
+            vs_uncond = self.expert_target(x_s, sig_vec, x0_u, mode='full')
             vs_fm_c = self.expert_target(x_s, sig_vec, x0_c, mode=self.emp_fm_complement_mode)
             vs_fm_u = self.expert_target(x_s, sig_vec, x0_u, mode=self.emp_fm_complement_mode)
 
-        gap = fm = None
-        self_sq = cross = cos = None
-        if self.cfg_gap_weight != 0 or self.cfg_align_weight != 0:
+        gap = fm_rows = None
+        if self.cfg_gap_weight != 0:
             # the detach knob applies to the GAP only: the fm term must keep the
             # gradient on both branches, or it would never train the unconditional
             # field toward its own expert target.
@@ -550,56 +512,41 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             if vs_cond is not None:              # 'zero' target leaves v* out (a=v_cond)
                 a = a - vs_cond
                 b = b - vs_uncond
-            # The full CFG term, taken directly:
+            # The CFG term, taken directly:
             #   || (v_cond - v_uncond) - (v*_cond - v*_uncond) ||^2  ==  || a - b ||^2
             # scaled by cfg_gap_weight (w_cfg) where it is added to the loss.
             # cfg_gap_reweight: the flow loss's own per-row sigma weight (0.5 * its
             # rescale, i.e. the pretraining logit-normal mass), so the gap is weighted
             # along sigma exactly as emp_fm and the on-path FM are. None -> plain mean.
-            rw = self._loss_row_weights(t) if self.cfg_gap_reweight else None
+            rw = row_lw if self.cfg_gap_reweight else None
             wmean = (lambda rows: (rw * rows).mean()) if rw is not None else \
                 (lambda rows: rows.mean())
-            if self.cfg_gap_weight != 0:
-                if rw is not None:
-                    gap = wmean((a - b).pow(2).flatten(1).mean(1))
-                else:
-                    gap = (a - b).pow(2).mean()
-                # Diagnostic split of the gap across AsymJiT's rank-8 basis. The loss
-                # is over all 196608 dims, of which the subspace is 1.04%, so it is
-                # numerically complement-dominated -- but that is only a problem if
-                # the complement's share is noise rather than signal. Synthetic
-                # modelling says signal and bank-sampling noise follow the SAME
-                # spectrum (the error of a bank average IS the data covariance / n),
-                # leaving SNR roughly flat across the split; these two scalars test
-                # that on real data. gap == cfg_gap_sub + cfg_gap_comp exactly, the
-                # projection being orthogonal.
-                with torch.no_grad():
-                    g = a - b
-                    g_sub = self.project_fn(g)
-                    # diagnostics carry the same row weighting as the loss, so
-                    # cfg_gap == cfg_gap_sub + cfg_gap_comp still holds
-                    gap_sub = wmean(g_sub.pow(2).flatten(1).mean(1))
-                    gap_comp = wmean((g - g_sub).pow(2).flatten(1).mean(1))
-                    # per-row gap (weighted likewise, so gap == gap_rows.mean()), for
-                    # logging the t=1 rows apart from the landing ones
-                    gap_rows = g.pow(2).flatten(1).mean(1)
-                    gap_raw = gap_rows.mean()                # unweighted, comparable to old runs
-                    if rw is not None:
-                        gap_rows = rw * gap_rows
-            # grad-carrying cosine: the alignment term's loss is -w * cos, so
-            # minimising it maximises the direction agreement.
-            af, bf = a.flatten(1), b.flatten(1)
-            cos = ((af * bf).sum(-1)
-                   / af.norm(dim=-1).clamp_min(1e-6)
-                   / bf.norm(dim=-1).clamp_min(1e-6)).mean()
-            # Diagnostics only -- these no longer enter the loss. They report the
-            # expansion ||a - b||^2 = ||a||^2 + ||b||^2 - 2<a, b>, so cfg_self and
-            # cfg_cross say how much of the term is per-branch magnitude versus
-            # residual correlation, and cfg_cos gives the direction agreement with
-            # the magnitudes divided out.
+            if rw is not None:
+                gap = wmean((a - b).pow(2).flatten(1).mean(1))
+            else:
+                gap = (a - b).pow(2).mean()
+            # Diagnostic split of the gap across AsymJiT's rank-8 basis. The loss
+            # is over all 196608 dims, of which the subspace is 1.04%, so it is
+            # numerically complement-dominated -- but that is only a problem if
+            # the complement's share is noise rather than signal. Synthetic
+            # modelling says signal and bank-sampling noise follow the SAME
+            # spectrum (the error of a bank average IS the data covariance / n),
+            # leaving SNR roughly flat across the split; these two scalars test
+            # that on real data. gap == cfg_gap_sub + cfg_gap_comp exactly, the
+            # projection being orthogonal.
             with torch.no_grad():
-                self_sq = a.pow(2).mean() + b.pow(2).mean()
-                cross = (af * bf).sum(-1).mean() / af.shape[1]   # raw <a,b>, per element
+                g = a - b
+                g_sub = self.project_fn(g)
+                # diagnostics carry the same row weighting as the loss, so
+                # cfg_gap == cfg_gap_sub + cfg_gap_comp still holds
+                gap_sub = wmean(g_sub.pow(2).flatten(1).mean(1))
+                gap_comp = wmean((g - g_sub).pow(2).flatten(1).mean(1))
+                # per-row gap (weighted likewise, so gap == gap_rows.mean()), for
+                # logging the t=1 rows apart from the landing ones
+                gap_rows = g.pow(2).flatten(1).mean(1)
+                gap_raw = gap_rows.mean()                # unweighted, comparable to old runs
+                if rw is not None:
+                    gap_rows = rw * gap_rows
         fm_cond_frac = emp_subfrac = None
         if self.emp_fm_weight != 0:
             # per-row CFG dropout: keep -> regress the CONDITIONAL branch onto
@@ -608,45 +555,17 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             # over both branches.
             keep = torch.rand(m, device=v_cond.device) < self.band_prob_class
             sel = keep.reshape(m, *([1] * (v_cond.dim() - 1)))
-            fm = self.flow_loss(dict(
-                u_t_pred=torch.where(sel, v_cond, v_uncond),
-                u_t=torch.where(sel, vs_fm_c, vs_fm_u),
-                timesteps=t))
+            r = torch.where(sel, v_cond, v_uncond) - torch.where(sel, vs_fm_c, vs_fm_u)
+            # flow_loss's per-row value: flat-mean squared error times its row weight
+            fm_rows = r.float().pow(2).flatten(1).mean(1) * row_lw
             with torch.no_grad():   # where emp_fm's residual sits, as for the gap
-                r = torch.where(sel, v_cond, v_uncond) - torch.where(sel, vs_fm_c, vs_fm_u)
+                r = r.detach()
                 r_sub = self.project_fn(r)
                 emp_subfrac = r_sub.pow(2).mean() / r.pow(2).mean().clamp_min(1e-12)
             fm_cond_frac = keep.float().mean().detach()
             emp_subfrac = emp_subfrac.detach()
-        # self_sq / cross / cos are returned for LOGGING ONLY (see above).
-        return gap, fm, (fm_cond_frac, emp_subfrac), \
-            (gap_sub, gap_comp, gap_rows, gap_raw) if gap is not None else None, \
-            (None if self_sq is None else self_sq.detach()), \
-            (None if cross is None else cross.detach()), cos
-
-    def _band_traj_count(self, x_0, t_split):
-        """How many rollout trajectories the band needs, with ``band_batch='auto'``.
-
-        The band should supply the same number of points the DAGGER carve gives the
-        high-sigma region: ``p_high * batch``, where ``p_high = P(sigma >= t_split)``
-        under the model's own timestep distribution. Each trajectory contributes one
-        point per SCORED band state, so
-
-            n_traj = round(p_high * batch)
-
-        and each trajectory contributes exactly ONE band state (drawn uniformly), so
-        the band supplies p_high * batch rows -- the same count the DAGGER carve gives
-        sigma >= t_split, with the same t-marginal. At t_split=0.92, batch=256 that is
-        round(0.080 * 256) = 20.
-
-        Scoring EVERY state of a trajectory instead would multiply the band's share of
-        the objective by n_states, which is a change of objective rather than of
-        estimator -- so the count is not divided by n_states.
-        """
-        if not self.band_batch_auto:
-            return min(self.mmd_batch, x_0.size(0))
-        n = int(round(self.high_sigma_fraction() * x_0.size(0)))
-        return max(1, min(n, x_0.size(0)))
+        return gap, fm_rows, (fm_cond_frac, emp_subfrac), \
+            (gap_sub, gap_comp, gap_rows, gap_raw) if gap is not None else None
 
     def _draw_band_labels(self, n, device, batch_labels=None):
         """The rollout's classes. Independent of the minibatch unless
@@ -682,28 +601,66 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         return uniq[torch.arange(n, device=device) % uniq.numel()]
 
     def _band_row_count(self, n_batch):
-        """How many (trajectory, band-time) pairs the point terms score.
+        """How many (trajectory, band-time) pairs the point terms score per step.
 
-        ``n_batch`` is the FULL micro-batch, not the trajectory slice: this is the
-        band's share of the training batch, so reading it off an already-sliced x_0
-        would shrink it to p_high * p_high * batch.
+        ``n_batch`` is the FULL micro-batch, not the trajectory slice; the step's
+        batch is ``n_batch * mmd_accum_steps`` (the band runs on one micro-batch per
+        step), so the count does not move with gradient accumulation.
 
-        ``'auto'`` is the band's own point budget, ``round(p_high * batch)`` -- the
-        same count the DAGGER carve gives sigma >= t_split, so the band keeps its
-        share of the objective whatever the trajectory count is.
+        ``'auto'`` is the expert's row share of that batch under the carve,
+        ``round(p_high * (1 - band_frac_on_path) * batch)`` -- the rows that make
+        every FM row of the step weigh the same (see :meth:`_carve_counts`). With
+        emp_fm off the rows displace nothing and serve the CFG gap / MMD alone, so
+        they take the whole band's ``round(p_high * batch)``.
         """
         if self.band_rows == 'auto':
-            return max(1, int(round(self.high_sigma_fraction() * n_batch)))
+            share = self.high_sigma_fraction()
+            if self.emp_fm_weight != 0:
+                share *= 1.0 - self.band_frac_on_path
+            return max(1, int(round(share * n_batch * self.mmd_accum_steps)))
         return max(1, int(self.band_rows))
 
-    def _n_band_states(self, x_ref, t_split):
-        """How many states :meth:`_band_rollout` returns, read off the solver grid
-        WITHOUT rolling out (same loop as there), so the scored (trajectory, band time)
-        pairs can be drawn before the rollout. Checked against the rollout at use."""
+    def _carve_counts(self, n_batch, n_expert):
+        """Row split of one micro-batch under the carve: ``(n_on, n_above)``.
+
+        The FM loss is ONE mean over the micro-batch, as in d-flow and DAGGER's
+        proportional carve: the band's ``n_expert`` rows replace that many on-path
+        rows, and of the ``n_on`` on-path rows left, ``n_above`` are the real-data
+        share of the band (``band_frac_on_path``, sigma >= t_split) and the rest sit
+        below the edge. Every row then weighs ``1 / batch`` after accumulation, and
+        the row counts alone carry reg_ft's sigma allocation -- the per-row
+        logit-normal weight inside flow_loss turns them into its mass. ``n_above``
+        is taken in every micro-batch of a band iteration, the expert rows only in
+        the one that runs the band.
+        """
+        n_on = n_batch - n_expert
+        n_above = int(round(self.high_sigma_fraction() * self.band_frac_on_path * n_batch))
+        assert 0 < n_on and n_above <= n_on, (
+            f'the carve needs {n_expert} expert + {n_above} in-band on-path rows out of '
+            f'a {n_batch}-row micro-batch; lower band_rows or the accumulation.')
+        return n_on, n_above
+
+    def _band_grid(self, x_ref, t_split):
+        """The band's solver grid, read off WITHOUT rolling out (same loop as
+        :meth:`_band_rollout`): ``(n_states, cell_w)``. ``n_states`` lets the scored
+        (trajectory, band time) pairs be drawn before the rollout (checked against it
+        at use).
+
+        ``cell_w[k]`` corrects the flow loss's sigma weight at band state ``k`` from
+        its value AT the state to the mass of the state's CELL. reg_ft draws sigma
+        continuously; a rollout row sits on a grid state and stands for the cell
+        ``[sigma_k, sigma_{k-1})`` up to the state above it (1 for the first, capped
+        at ``mmd_t_hi``; the lowest cell runs down to ``t_split``), so the cells tile
+        the band. With states drawn uniformly, the row weight that reproduces reg_ft
+        is the cell's integrated weight over the MEAN cell width. Read at the state
+        instead, the steep logit-normal (0.82 at sigma 0.92, 0.015 at 0.98) is taken
+        at the cells' lower edges and overstates the band by ~1.44x. Exactly 1 for
+        a sigma-independent weight.
+        """
         seq_len = x_ref.shape[2:].numel()
         key = (seq_len, float(t_split), self.mmd_nfe, self.mmd_t_hi, self.mmd_sampler)
-        if self._n_states_key != key:
-            grid = self._build_mmd_sampler(seq_len, x_ref.device).sigmas
+        if self._grid_key != key:
+            grid = self._build_mmd_sampler(seq_len, x_ref.device).sigmas.double().cpu()
             n_pre = 0
             if self.mmd_t_hi is not None:
                 while 2 * (n_pre + 1) < len(grid) \
@@ -713,53 +670,51 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             while 2 * (n_band + 1) < len(grid) \
                     and float(grid[2 * (n_band + 1)]) >= t_split:
                 n_band += 1
-            self._n_states_key, self._n_states = key, n_band - n_pre
-        return self._n_states
+            sig, mass, width = [], [], []
+            for n in range(n_pre, n_band):
+                s = float(grid[2 * (n + 1)])
+                hi = float(grid[2 * n])
+                if self.mmd_t_hi is not None:
+                    hi = min(hi, self.mmd_t_hi)
+                lo = float(t_split) if n == n_band - 1 else s
+                # midpoint rule over the cell; the weight is smooth, so 1024 is plenty
+                edges = torch.linspace(lo, hi, 1025, dtype=torch.float64)
+                mids = (edges[1:] + edges[:-1]) / 2
+                sig.append(s)
+                mass.append(float(self._sigma_weight(mids).mean()) * (hi - lo))
+                width.append(hi - lo)
+            sig = torch.tensor(sig, dtype=torch.float64)
+            mean_width = sum(width) / max(len(width), 1)
+            cell_w = torch.tensor(mass, dtype=torch.float64) / mean_width \
+                / self._sigma_weight(sig).clamp_min(1e-300)
+            self._grid_key, self._grid = key, (n_band - n_pre, cell_w)
+        return self._grid
+
+    def _sigma_weight(self, sigma):
+        """The flow loss's per-row sigma weight (its rescale_fn) at ``sigma``."""
+        sigma = torch.as_tensor(sigma, dtype=torch.float64)
+        return self.flow_loss.rescale_fn(torch.ones_like(sigma), sigma * self.num_timesteps)
+
+    def _n_band_states(self, x_ref, t_split):
+        """How many states :meth:`_band_rollout` returns (see :meth:`_band_grid`)."""
+        return self._band_grid(x_ref, t_split)[0]
 
     def _needs_banks(self):
-        """Whether any enabled term reads v*: the fm term always does, the gap and
-        alignment terms unless running the expert-free 'zero' ablation."""
+        """Whether any enabled term reads v*: the fm term always does, the gap
+        unless running the expert-free 'zero' ablation."""
         return self.emp_fm_weight != 0 or (
-            (self.cfg_gap_weight != 0 or self.cfg_align_weight != 0)
-            and self.cfg_gap_target == 'expert')
+            self.cfg_gap_weight != 0 and self.cfg_gap_target == 'expert')
 
     def _draw_band_plan(self, x_0, t_split, batch_labels=None):
         """Everything random about one band BEFORE it runs: the rollout's classes and
-        the scored (trajectory, band time) pairs, drawn independently as in d-flow.
+        the scored (trajectory, band time) pairs, so the bank IO can be issued ahead.
 
-        Drawing the pairs up front is what lets the bank IO skip trajectories no row
-        will score: ``n_rows`` draws with replacement over ``m`` trajectories hit only
-        ~``m * (1 - (1 - 1/m)^n_rows)`` distinct ones (~13.5 of 21 at the defaults),
-        and banks are loaded for exactly those (``traj``). The draw is the same as
-        before -- only its timing moves -- so the estimator is unchanged.
-
-        ``band_one_per_traj`` replaces the draw: ``n_rows`` trajectories, row ``j`` on
-        trajectory ``j`` at a uniform band state, and the t=1 rows on ``n_start``
-        further trajectories that are never rolled out (``n_roll`` marks the split).
+        ONE scored row per trajectory: ``n_rows`` trajectories, row ``j`` on trajectory
+        ``j`` at a band state drawn uniformly (the band's t-marginal is uniform over
+        the grid), and the t=1 rows of ``band_score_start`` on ``n_start`` further
+        trajectories that are never rolled out (``n_roll`` marks the split). One bank
+        per trajectory, ``traj`` = all of them.
         """
-        if self.band_one_per_traj:
-            return self._draw_band_plan_one_per_traj(x_0, t_split, batch_labels)
-        m = self._band_traj_count(x_0, t_split)
-        labels = self._draw_band_labels(m, x_0.device, batch_labels)
-        n_rows = self._band_row_count(x_0.size(0))
-        n_states = self._n_band_states(x_0, t_split)
-        j_pick = torch.randint(m, (n_rows, )).tolist()
-        k_pick = torch.randint(n_states, (n_rows, )).tolist()
-        plan = dict(labels=labels, j_pick=j_pick, k_pick=k_pick,
-                    n_states=n_states, traj=sorted(set(j_pick)))
-        if self.band_score_start:
-            # t=1 rows for the point terms, at the share each landing state gets. Drawn
-            # from the trajectories already holding banks, so they add no IO; the
-            # trajectories are i.i.d., so this is still a uniform draw over them.
-            n_start = max(1, int(round(n_rows / max(n_states, 1))))
-            traj = plan['traj']
-            plan['j_start'] = [traj[i] for i in torch.randint(len(traj), (n_start, )).tolist()]
-        return plan
-
-    def _draw_band_plan_one_per_traj(self, x_0, t_split, batch_labels=None):
-        """:meth:`_draw_band_plan` under ``band_one_per_traj``: every scored row on its
-        own trajectory. Same row counts and the same uniform t-marginal over the band
-        grid; only the trajectory sharing (and with it the bank count) changes."""
         n_states = self._n_band_states(x_0, t_split)
         n_rows = min(self._band_row_count(x_0.size(0)), x_0.size(0))
         n_start = max(1, int(round(n_rows / max(n_states, 1)))) \
@@ -896,9 +851,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         scored state (the banks depend on the row's class, not on sigma). Returns
         banks for ``plan['traj']`` only, in that order.
 
-        This is the expensive part of the arm: ``band_batch * (bank_size +
-        null_bank_size)`` images are loaded and encoded, every iteration the band
-        runs. Budget it with ``band_batch``, the expert's ``bank_size`` /
+        This is the expensive part of the arm: ``(band_rows + start rows) *
+        (bank_size + null_bank_size)`` images are loaded and encoded, every iteration
+        the band runs. Budget it with ``band_rows``, the expert's ``bank_size`` /
         ``null_bank_size``, and ``mmd_interval`` -- see the config's cost note.
         """
         expert = self._dagger_expert
@@ -1030,7 +985,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         device = x_ref.device
         x0, exclude = [], []
         for r, k in enumerate(plan['x0_entry']):
-            bank = banks[0][r]          # plan['traj'] is range(n_rows) under 1pt
+            bank = banks[0][r]          # plan['traj'] is range(n_rows)
             assert isinstance(bank, U8Bank), (
                 "band_states='onpath' needs the expert's bank_storage='u8'.")
             x0.append(bank.entry(k, device))
@@ -1042,22 +997,24 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         return x_t, t / self.num_timesteps, exclude
 
     def _onpolicy_loss(self, x_0, plan, t_split, encode_fn=None):
-        """One shared band rollout; the CFG-gap and (optional) MMD terms on top.
+        """One shared band rollout; the CFG-gap and (optional) MMD terms on top, and
+        emp_fm's rows as a SUM over the micro-batch ``x_0`` -- they are the expert
+        share of the shared FM mean (see :meth:`forward_train`).
         ``plan`` (from :meth:`_draw_band_plan`) fixes the classes and scored pairs."""
         self._band_t = {}
         t_band = self._synced_clock(x_0.device)
+        n_batch = x_0.size(0)   # the shared FM mean's denominator
         labels = plan['labels']
         m = labels.numel()
         x_0 = x_0[:m].detach()
-        # band_one_per_traj: only the first n_roll trajectories are rolled out; the
-        # rest carry a t=1 row alone (see _draw_band_plan_one_per_traj)
-        n_roll = plan.get('n_roll', m)
+        # only the first n_roll trajectories are rolled out; the rest carry a t=1 row
+        # alone (see _draw_band_plan)
+        n_roll = plan['n_roll']
 
         use_mmd = self.mmd_weight != 0
         use_fm = self.emp_fm_weight != 0
         use_gap = self.cfg_gap_weight != 0
-        use_align = self.cfg_align_weight != 0
-        use_point = use_gap or use_fm or use_align  # terms sharing the per-state forward
+        use_point = use_gap or use_fm  # terms sharing the per-state forward
         # The trajectory graph exists only for MMD: the CFG-gap term reads detached
         # states, so with MMD off the rollout is pure inference and costs no
         # activations. See the class docstring.
@@ -1089,12 +1046,10 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # unaffected below: it is a set statistic and still uses every state.
         pick = None
         if use_point and states:
-            # INDEPENDENT draws over (trajectory, band time), matching d-flow: a
-            # trajectory may supply several rows or none. Rows and trajectories are
-            # separate knobs -- the band's t-marginal stays uniform over the grid
-            # either way, but the row count no longer has to equal the rollout width.
-            # The pairs were drawn in _draw_band_plan, before the rollout, so the
-            # banks could be loaded for the scored trajectories alone.
+            # ONE row per trajectory (each costs a bank), at a band state drawn
+            # uniformly, so the band's t-marginal is uniform over the grid. The pairs
+            # were drawn in _draw_band_plan, before the rollout, so the banks could be
+            # loaded for the scored trajectories alone.
             assert len(states) == plan['n_states'], (
                 f"band rollout returned {len(states)} states but the plan was drawn "
                 f"over {plan['n_states']}; _n_band_states is out of sync with "
@@ -1102,19 +1057,23 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             j_pick, k_pick = list(plan['j_pick']), plan['k_pick']
             xs = [states[k][1][j].detach() for j, k in zip(j_pick, k_pick)]
             sigs = [states[k][0] for k in k_pick]
+            # each grid row carries its cell's mass, not the weight at its state
+            row_w = self._band_grid(x_0, t_split)[1][k_pick]
             land_rows = None
             if start is not None:
                 # t=1 rows appended after the landing ones (land_rows marks the latter,
-                # for logging the two apart); every point term scores all rows
+                # for logging the two apart, and keeps them out of emp_fm's FM rows);
+                # every other point term scores all rows
                 n_land = len(j_pick)
                 xs += [start[1][j].detach() for j in plan['j_start']]
                 sigs += [start[0]] * len(plan['j_start'])
                 j_pick += plan['j_start']
+                row_w = torch.cat([row_w, row_w.new_ones(len(plan['j_start']))])
                 land_rows = torch.arange(len(j_pick), device=x_0.device) < n_land
             x_pick = torch.stack(xs)
             sig_pick = x_0.new_tensor(sigs)
             lab_pick = labels[torch.as_tensor(j_pick, device=labels.device)]
-            pick = (x_pick, sig_pick, lab_pick, j_pick, land_rows)
+            pick = (x_pick, sig_pick, lab_pick, j_pick, land_rows, row_w)
 
         # One bank set per iteration, reused by every scored state, for the scored
         # trajectories only (plan['traj']).
@@ -1124,10 +1083,11 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         exclude = None
         if onpath and use_point:
             x_pick, sig_pick, exclude = self._onpath_band_states(plan, banks, x_0)
-            pick = (x_pick, sig_pick, labels, list(range(m)), None)
+            # continuous sigma, as reg_ft draws it: the weight at the row is exact
+            pick = (x_pick, sig_pick, labels, list(range(m)), None, None)
 
         gap_sigmas, gap_vals, fm_vals = [], [], []
-        self_vals, cross_vals, cos_vals, frac_vals = [], [], [], []
+        frac_vals = []
         sub_vals, comp_vals, empsub_vals, t1_vals, land_vals, raw_vals = [], [], [], [], [], []
         if pick is not None:
             # banks are indexed by position in plan['traj'], so re-index them onto the
@@ -1137,8 +1097,9 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 pos = {j: i for i, j in enumerate(plan['traj'])}
                 banks_pick = ([banks[0][pos[j]] for j in pick[3]],
                               [banks[1][pos[j]] for j in pick[3]])
-            gap, fm, fmdiag, gsplit, self_sq, cross, cos = self._band_point_losses(
-                pick[0], pick[1], pick[2], banks=banks_pick, exclude=exclude)
+            gap, fm_rows, fmdiag, gsplit = self._band_point_losses(
+                pick[0], pick[1], pick[2], banks=banks_pick, exclude=exclude,
+                row_w=pick[5])
             gap_sigmas.append(float(pick[1].mean()))
             if True:
                 if gap is not None:
@@ -1148,14 +1109,11 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                     if pick[4] is not None:   # the gap at t=1 vs at the landing states
                         t1_vals.append(gsplit[2][~pick[4]].mean())
                         land_vals.append(gsplit[2][pick[4]].mean())
-                if fm is not None:
-                    fm_vals.append(fm)
+                if fm_rows is not None:
+                    # the t=1 start rows are not FM rows: the carve made room for
+                    # the landing rows only (and their weight is ~1e-52 anyway)
+                    fm_vals.append(fm_rows if pick[4] is None else fm_rows[pick[4]])
                     frac_vals.append(fmdiag[0]); empsub_vals.append(fmdiag[1])
-                if self_sq is not None:
-                    self_vals.append(self_sq)
-                    cross_vals.append(cross)
-                if cos is not None:
-                    cos_vals.append(cos)
 
         mmd_loss = mmd_log_vars = None
         if use_mmd:
@@ -1175,7 +1133,8 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # averaging would shrink it by 1/W. The CFG-gap term is an ordinary
         # per-point mean -- every rank computes the same quantity over its own
         # rows -- so DDP averaging is already correct and it must NOT be rescaled.
-        # The empirical-FM term is likewise an ordinary per-point mean.
+        # emp_fm takes NO *acc at all: its rows are part of this micro-batch's
+        # shared FM mean, which train_grad_accum's 1/N normalises like any other.
         acc = float(self.mmd_accum_steps)
         loss = x_0.new_zeros(())
         log_vars = dict(band_steps=loss.new_tensor(float(len(states)) * acc),
@@ -1193,6 +1152,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             for sigma, v in zip(gap_sigmas, gap_vals):
                 log_vars[f'cfg_gap_s{sigma:.3f}'] = v.detach() * acc
             log_vars['loss_cfg_gap'] = (self.cfg_gap_weight * gap).detach() * acc
+            log_vars['w_cfg'] = loss.new_tensor(self.cfg_gap_weight * acc)
             # where the gap's energy sits: subspace is 8/768 = 1.04% of the dims, so
             # cfg_gap_sub >> 0.0104 * cfg_gap means class structure concentrates in
             # AsymJiT's basis and a projected target would be worth testing.
@@ -1206,30 +1166,23 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
                 log_vars['cfg_gap_t1'] = torch.stack(t1_vals).mean() * acc
                 log_vars['cfg_gap_land'] = torch.stack(land_vals).mean() * acc
                 log_vars['band_rows_t1'] = loss.new_tensor(float((~pick[4]).sum()) * acc)
-        if cos_vals:
-            cos_mean = torch.stack(cos_vals).mean()
-            if self.cfg_align_weight != 0:
-                # loss = -w * cos, so minimising it MAXIMISES the direction
-                # agreement between the two branches' residuals. Bounded in [-w, w]
-                # and scale free, so magnitudes stay the business of emp_fm.
-                loss = loss - self.cfg_align_weight * cos_mean * acc
-                log_vars['loss_cfg_align'] = \
-                    (-self.cfg_align_weight * cos_mean).detach() * acc
-                log_vars['w_align'] = loss.new_tensor(self.cfg_align_weight * acc)
-            log_vars['cfg_cos'] = cos_mean.detach() * acc
-        if self_vals:
-            # the two halves of the gap, logged separately so the sweep is readable:
-            # cfg_self = ||a||^2 + ||b||^2, cfg_cross = <a, b> (raw, unweighted).
-            log_vars['cfg_self'] = torch.stack(self_vals).mean() * acc
-            log_vars['cfg_cross'] = torch.stack(cross_vals).mean() * acc
-            log_vars['w_cfg'] = loss.new_tensor(self.cfg_gap_weight * acc)
         if fm_vals:
-            fm = torch.stack(fm_vals).mean()
-            loss = loss + self.emp_fm_weight * fm * acc
+            fm_rows = torch.cat(fm_vals)
+            assert fm_rows.numel() == plan['n_roll'], (
+                f"emp_fm scored {fm_rows.numel()} rows but the carve made room for "
+                f"{plan['n_roll']}.")
+            # the expert share of the shared FM mean: summed over its rows, divided
+            # by the micro-batch like the on-path rows it replaced
+            fm_term = self.emp_fm_weight * fm_rows.sum() / n_batch
+            loss = loss + fm_term
+            # per-row mean, comparable to the DAGGER arms' loss_dagger
+            fm = fm_rows.mean()
             log_vars['emp_fm'] = fm.detach() * acc
-            for sigma, v in zip(gap_sigmas, fm_vals):
-                log_vars[f'emp_fm_s{sigma:.3f}'] = v.detach() * acc
-            log_vars['loss_emp_fm'] = (self.emp_fm_weight * fm).detach() * acc
+            for sigma in gap_sigmas:
+                log_vars[f'emp_fm_s{sigma:.3f}'] = fm.detach() * acc
+            # its contribution to the step's loss (train_grad_accum's 1/N included)
+            log_vars['loss_emp_fm'] = fm_term.detach()
+            log_vars['band_fm_rows'] = loss.new_tensor(float(fm_rows.numel()) * acc)
             # realised conditional fraction -- should sit at band_prob_class (0.9)
             log_vars['fm_cond_frac'] = torch.stack(frac_vals).mean() * acc
             log_vars['emp_fm_subfrac'] = torch.stack(empsub_vals).mean() * acc
@@ -1267,7 +1220,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # A replay buffer is allowed ONLY when it feeds the inherited DAGGER stream
         # while the band terms stay online. The band's own points always come from a
         # rollout taken with the CURRENT weights -- never from the buffer -- so the
-        # CFG-gap/alignment/MMD terms remain strictly on-policy even here. What the
+        # CFG-gap/MMD terms remain strictly on-policy even here. What the
         # buffer must not do is supply those band points, which it cannot: it is
         # consumed only by GaussianFlowDagger.forward_train below.
         # Claim + prefetch BEFORE the flow-matching step: the claim decides which
@@ -1276,8 +1229,11 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         t_split_pre = self.mmd_t_split if self.mmd_t_split is not None else self.t_split
         band_labels = class_labels_true if class_labels_true is not None \
             else kwargs.get('class_labels', None)
-        run_band = (self._band_claim(running_status) and t_split_pre is not None
-                    and band_labels is not None)
+        band_ok = t_split_pre is not None and band_labels is not None
+        run_band = self._band_claim(running_status) and band_ok
+        # every micro-batch of a band iteration, not only the one that runs the band:
+        # all of them take the carve's on-path split (see _carve_counts)
+        band_iter = band_ok and self._band_due(running_status)
         plan = None
         if run_band:
             if self._bank_ready is not None:
@@ -1297,31 +1253,26 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             'would leave the band supervised twice. Set emp_fm_weight=0 to let the '
             'DAGGER stream own the band, or drop the DaggerRolloutHook.')
 
-        # On-path flow matching. Truncated to sigma < the band edge whenever an
-        # on-policy term already covers the band (see onpath_truncate), so the two
-        # supervisions are exclusive: FM owns sigma < t_split, the band terms own
-        # sigma >= t_split. Otherwise full-range, exactly as reg_ft.
-        if self._truncate_onpath():
-            # band_frac_on_path of the band's mass goes to REAL data: draw that many
-            # on-path rows from sigma >= t_split instead of below it, so the on-path
-            # term covers sigma < t_split PLUS a mix-in inside the band, exactly as
-            # DAGGER's carve does. n_above is the share of this batch that lands in
-            # the band, conditional on the row being an on-path row.
-            p_high = self.high_sigma_fraction()
-            f = self.band_frac_on_path
-            w_on = (1.0 - p_high) + p_high * f      # this term's total sigma mass
-            n_above = int(round(x_0.size(0) * (p_high * f) / max(w_on, 1e-8)))
+        # On-path flow matching. In a band iteration with the on-path truncated (i.e.
+        # emp_fm on), THE CARVE, as in d-flow and DAGGER's proportional carve: the FM
+        # loss is ONE mean over this micro-batch, the band's expert rows (emp_fm,
+        # summed in _onpolicy_loss) take the place of as many on-path rows, and the
+        # on-path rows left stop at the band edge apart from band_frac_on_path's
+        # real-data share of it. Every FM row of the step then weighs 1/batch, so the
+        # row counts alone carry reg_ft's sigma allocation. Otherwise -- no band this
+        # iteration (warmup, interval) or no emp_fm -- full-range, exactly as reg_ft.
+        if self._truncate_onpath() and band_iter:
+            n_batch = x_0.size(0)
+            n_expert = plan['n_roll'] if (run_band and self.emp_fm_weight != 0) else 0
+            n_on, n_above = self._carve_counts(n_batch, n_expert)
+            kw_on = dict(kwargs)
+            if torch.is_tensor(kw_on.get('class_labels', None)):
+                kw_on['class_labels'] = kw_on['class_labels'][:n_on]
             loss, log_vars = self._onpath_loss(
-                x_0, truncate=True, use_expert=False, n_above=n_above, **kwargs)
+                x_0[:n_on], truncate=True, use_expert=False, n_above=n_above, **kw_on)
+            loss = loss * (n_on / n_batch)   # its rows' share of the micro-batch mean
+            log_vars['onpath_rows'] = loss.new_tensor(float(n_on))
             log_vars['onpath_n_above'] = loss.new_tensor(float(n_above))
-            if self.onpath_truncate_rescale:
-                # Truncation alone leaves the WHOLE batch below the split, so the
-                # data region would carry 1/P(sigma < t_split) ~ 1.14x its reg_ft
-                # mass and the effective LR there would jump. Scaling by that
-                # probability restores reg_ft's allocation exactly -- what the DAGGER
-                # arms get instead by carving the batch into n_on / n_roll rows.
-                loss = loss * w_on
-                log_vars['onpath_w'] = loss.new_tensor(w_on)
         else:
             # forward the DAGGER buffer through: GaussianFlowDagger.forward_train
             # mixes its expert-labelled rollout term in as the usual convex

@@ -29,11 +29,8 @@ logit-normal rescale, a heavy down-weight at these sigmas, plus its internal 0.5
 while the gap is a plain mean. So w_cfg = 1 is not "equal footing" -- read the
 logged cfg_gap against emp_fm and loss_diffusion (~0.06) before trusting a range.
 
-Logged every banded iteration: cfg_gap = the term actually optimised, plus the
-diagnostics cfg_self = ||a||^2+||b||^2, cfg_cross = <a,b>, cfg_cos = their cosine
-(a = v_cond - v*_cond, b = v_uncond - v*_uncond). cfg_cos is the one to watch -- if
-the two residuals are uncorrelated it sits at ~0 and the coupling has nothing to
-pin.
+Logged every banded iteration: cfg_gap = the term actually optimised, with its
+subspace / complement split (cfg_gap_sub, cfg_gap_comp).
 
 MMD is OFF (mmd_weight=0, inherited), so the rollout is pure inference under
 no_grad and the band term is an ordinary per-point regression at detached states.
@@ -63,8 +60,8 @@ _base_ = ['./asymflow_h_16_r8_imagenet_onpolicy_4gpus.py']
 
 # w_cfg: the coefficient on the FULL CFG term
 #     w_cfg * || (v_cond - v_uncond) - (v*_cond - v*_uncond) ||^2
-# (the cosine/cross decomposition this config used to sweep is gone -- cfg_self,
-# cfg_cross and cfg_cos are still logged, but as diagnostics only.)
+# (the cosine/cross decomposition this config used to sweep is gone, diagnostics
+# included.)
 _w = os.environ.get('LAKON_CFG_GAP_WEIGHT', '1.0')
 
 name = f'asymflow_h_16_r8_imagenet_onpolicy_wcfg{_w}_4gpus'
@@ -92,12 +89,9 @@ model = dict(
         # DAGGER arms (dagger_full_*) all override to 'full' for the same reason.
         complement_mode='full',
         # cost knobs -- see the bank note above
-        band_batch=int(os.environ.get('LAKON_BAND_BATCH', 4)),
+        # (band_batch / cfg_gap_max_states are gone: one point per trajectory is
+        # hard-coded, so the bank count is band_rows)
         mmd_interval=int(os.environ.get('LAKON_BAND_INTERVAL', 1)),
-        # score the whole band rather than a random 2 states: with band_batch this
-        # small the extra states are the cheap way back to a usable gradient, and
-        # they reuse the SAME banks (the expensive part) at no extra IO.
-        cfg_gap_max_states=int(os.environ.get('LAKON_BAND_STATES', 6)),
     ),
 )
 

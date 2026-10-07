@@ -10,13 +10,14 @@ _U8_DEFAULT = '/dev/shm/asymflow/train_u8_256'
 
 
 class EmpiricalVelocity:
-    """Inference-time velocity override: for ``sigma > sigma_switch`` the sampler's
-    velocity is REPLACED by the empirical expert's conditional velocity
+    """Inference-time velocity override: for ``sigma_switch < sigma <= sigma_hi`` the
+    sampler's velocity is REPLACED by the empirical expert's conditional velocity
 
         v*_cond = (x_t - x0_hat) / sigma,    x0_hat = EmpiricalExpert.x0_hat over the
                                              row's ENTIRE class bank (x2 flips)
 
-    and below it the model (with CFG) takes over unchanged. It is the expert the
+    and outside that window the model (with CFG) runs unchanged -- above it when
+    ``sigma_hi < 1`` (default 1: v* from the very first step). It is the expert the
     band terms train on (bank_size=None, include_flips, feat kernel, optional
     temp_spread), so this measures what the band target does when it DRIVES the
     trajectory instead of being regressed onto.
@@ -31,7 +32,10 @@ class EmpiricalVelocity:
     1 -> sigma_switch is integrated with v* and the model starts from the predictor
     at the switch state. A Heun corrector is the one eval whose t is lower than the
     previous call's; that is how it is recognised. Leave it off for one-eval-per-step
-    samplers (Euler), where that test would also catch the next predictor.
+    samplers (Euler), where that test would also catch the next predictor. The upper
+    edge is cut the same way, by step: the step STARTING at sigma_hi is v*'s (both of
+    its evals), the one landing on it is the model's (its corrector included), so
+    v* integrates exactly sigma_hi -> sigma_switch.
 
     Banks are built per eval batch with :meth:`EmpiricalExpert.build_banks` (the
     u8 cache when present), one per distinct class, held as uint8 on the host and
@@ -48,6 +52,7 @@ class EmpiricalVelocity:
 
     def __init__(self,
                  sigma_switch=0.88,
+                 sigma_hi=1.0,
                  temp_spread=None,
                  kernel_space='feat',
                  include_flips=True,
@@ -55,11 +60,14 @@ class EmpiricalVelocity:
                  datalist='data/imagenet/train.txt',
                  data_root='data/imagenet/train/',
                  u8_cache='auto',
+                 u8_read_threads=8,
                  bank_chunk=1024,
                  num_classes=1000):
         if u8_cache == 'auto':
             u8_cache = _U8_DEFAULT if osp.exists(_U8_DEFAULT + '.complete') else None
         self.sigma_switch = float(sigma_switch)
+        self.sigma_hi = float(sigma_hi)
+        assert self.sigma_hi > self.sigma_switch, (sigma_switch, sigma_hi)
         self.complete_step = bool(complete_step)
         self.expert = EmpiricalExpert(
             datalist_path=datalist, data_root=data_root, num_classes=num_classes,
@@ -67,7 +75,9 @@ class EmpiricalVelocity:
             null_bank_size=1, null_bank_mode='shared',   # no null rows; keep its draw trivial
             include_flips=include_flips, kernel_space=kernel_space,
             temp_spread=(None if temp_spread is None else float(temp_spread)),
-            u8_cache=u8_cache, host_buffers=0)
+            # pread threads per process: a GPFS-resident cache is latency-bound per
+            # read, so more in flight helps there (a /dev/shm one tops out at ~8)
+            u8_cache=u8_cache, u8_read_threads=int(u8_read_threads), host_buffers=0)
         self.expert.bank_chunk = int(bank_chunk)
         self._labels = None
         self._banks = None
@@ -139,11 +149,13 @@ class EmpiricalVelocity:
         t = float(outputs['t'])
         sigma = t / diffusion.num_timesteps
         prev, self._prev_t = self._prev_t, t
-        above = sigma > self.sigma_switch + 1e-6
-        corrector_into_switch = (
-            self.complete_step and prev is not None and t < prev - 1e-9
-            and prev / diffusion.num_timesteps > self.sigma_switch + 1e-6)
-        if not (above or corrector_into_switch):
+        # each eval belongs to the step STARTING at sigma_k: its own t for a predictor,
+        # the previous call's for a Heun corrector. The step is v*'s iff
+        # sigma_switch < sigma_k <= sigma_hi (sigma_hi = 1 reduces to the original
+        # 'above the switch, plus the corrector landing on it').
+        corrector = self.complete_step and prev is not None and t < prev - 1e-9
+        start = (prev if corrector else t) / diffusion.num_timesteps
+        if not (self.sigma_switch + 1e-6 < start <= self.sigma_hi + 1e-6):
             return dict()
         x_t = outputs['x_t']
         v_model = outputs['denoising_output']
