@@ -54,6 +54,7 @@ class EmpiricalVelocity:
                  sigma_switch=0.88,
                  sigma_hi=1.0,
                  temp_spread=None,
+                 kde_tau2=None,
                  kernel_space='feat',
                  include_flips=True,
                  complete_step=True,
@@ -75,6 +76,7 @@ class EmpiricalVelocity:
             null_bank_size=1, null_bank_mode='shared',   # no null rows; keep its draw trivial
             include_flips=include_flips, kernel_space=kernel_space,
             temp_spread=(None if temp_spread is None else float(temp_spread)),
+            kde_tau2=kde_tau2,
             # pread threads per process: a GPFS-resident cache is latency-bound per
             # read, so more in flight helps there (a /dev/shm one tops out at ~8)
             u8_cache=u8_cache, u8_read_threads=int(u8_read_threads), host_buffers=0)
@@ -96,12 +98,26 @@ class EmpiricalVelocity:
             return p.pack(p.patchify(z, p.patch_size)) @ proj
         return feat_fn
 
+    @staticmethod
+    def _make_project_fn(diffusion):
+        """GaussianFlowDagger.project_fn for any AsymFlow denoiser: the latent-space
+        projector ``P z`` onto the rank-8 subspace (kde_tau2's shrinkage)."""
+        p = diffusion.denoising
+
+        def project_fn(z):
+            proj = p.proj_buffer.to(dtype=z.dtype, device=z.device)
+            _, _, h, w = z.shape
+            sub = p.pack(p.patchify(z, p.patch_size)) @ proj @ proj.T
+            return p.unpatchify(p.unpack(sub, h // p.patch_size, w // p.patch_size), p.patch_size)
+        return project_fn
+
     def begin(self, diffusion, labels, encode_fn):
         """Build this batch's class banks. ``labels`` are the rows' (real) classes,
         ``encode_fn`` maps [0, 1] images to the diffusion input space."""
         assert int(labels.max()) < self.expert.num_classes and int(labels.min()) >= 0, \
             'EmpiricalVelocity needs real class labels (not the null label)'
         self._feat_fn = self._make_feat_fn(diffusion)
+        self._project_fn = self._make_project_fn(diffusion)
         self._labels = labels
         cond_banks, _ = self.expert.build_banks(
             labels, encode_fn, self._feat_fn, labels.device)
@@ -136,7 +152,7 @@ class EmpiricalVelocity:
         ess, wmax = [], []
         for i, bank in enumerate(self._banks):
             fm = bank.feats if hasattr(bank, 'feats') else bank[1]
-            d2 = (feats[i].unsqueeze(0) - (1 - sc) * fm).pow(2).sum(-1) / (2.0 * sc ** 2)
+            d2 = (feats[i].unsqueeze(0) - (1 - sc) * fm).pow(2).sum(-1) / (2.0 * ex._lik_var(sc))
             if ex.temp_spread is not None and d2.numel() > 1:
                 d2 = d2 / (d2.std() / ex.temp_spread).clamp_min(1.0)
             w = torch.softmax(-d2, dim=0)
@@ -161,7 +177,7 @@ class EmpiricalVelocity:
         v_model = outputs['denoising_output']
         x0_hat = self.expert.x0_hat(
             x_t.float(), sigma, self._feat_fn, self._labels, self._banks, self._banks,
-            null_label=self.expert.num_classes)
+            null_label=self.expert.num_classes, project_fn=self._project_fn)
         v = (x_t.float() - x0_hat) / max(sigma, 1e-6)
         dims = tuple(range(1, v.dim()))
         rel = ((v - v_model.float()).pow(2).sum(dims).sqrt()

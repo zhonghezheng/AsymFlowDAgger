@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from ..builder import MODULES
-from .gaussian_flow_mmd import GaussianFlowMMD
+from .gaussian_flow_mmd import _MMD_TAGS, GaussianFlowMMD
 
 
 @MODULES.register_module()
@@ -417,13 +417,16 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
         # scores each row at its own noise level.
         t0 = self._synced_clock(x_s.device)
         with torch.no_grad():
+            # project_fn: kde_tau2's within-blob shrinkage lives in the feat kernel's
+            # subspace (unused for point atoms)
             x0_cond = expert.x0_hat(
                 x_s, sigma, self.feat_fn, labels,
-                cond_banks, null_banks, self.null_label, exclude=exclude)
+                cond_banks, null_banks, self.null_label, exclude=exclude,
+                project_fn=self.project_fn)
             t1 = self._synced_clock(x_s.device)
             x0_uncond = expert.x0_hat(
                 x_s, sigma, self.feat_fn, torch.full_like(labels, self.null_label),
-                cond_banks, null_banks, self.null_label)
+                cond_banks, null_banks, self.null_label, project_fn=self.project_fn)
         t2 = self._synced_clock(x_s.device)
         bt = self._band_t
         bt['band_t_x0hat_cond'] = bt.get('band_t_x0hat_cond', 0.0) + (t1 - t0)
@@ -1228,8 +1231,7 @@ class GaussianFlowOnPolicy(GaussianFlowMMD):
             # GaussianFlowMMD._mmd_score); its logged values are the true MMD^2
             loss = loss + self.mmd_weight * mmd_loss
             log_vars.update(mmd_log_vars)
-            tags = ('mmd_sub', 'mmd_raw') if self.mmd_feature == 'both' else (
-                'mmd_sub' if self.mmd_feature == 'subspace' else 'mmd_raw', )
+            tags = [_MMD_TAGS[sp] for sp in self._mmd_spaces()[0]]
             log_vars['loss_mmd'] = self.mmd_weight * sum(mmd_log_vars[t] for t in tags)
         # the band's forward wall time (its backward runs later, fused with the FM
         # term's) and the bank costs gathered on the way -- see _log_bank_cost

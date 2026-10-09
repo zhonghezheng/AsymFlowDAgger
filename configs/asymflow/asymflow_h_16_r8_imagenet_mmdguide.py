@@ -27,7 +27,7 @@ Env knobs (defaults in brackets):
   LAKON_MMDG_SHARE       'none' | 'bank' | 'both'        ['both']
   LAKON_MMDG_BS          rollouts per GPU per batch      ['64'  -> 512 pooled]
   LAKON_MMDG_BW          kernel widths: 'mean' | 'spread' ['mean']
-  LAKON_MMDG_FEAT        MMD space: 'raw' | 'subspace'   ['raw']
+  LAKON_MMDG_FEAT        MMD space: 'raw' | 'subspace' | 'split' ['raw']
   LAKON_MMDG_KERNEL      'rbf' | 'energy' (distance kernel, no bandwidth) ['rbf']
   LAKON_MMDG_BWS         RBF width multipliers, comma list ['0.25,0.5,1,2,4']
   LAKON_MMDG_KNORM       1 = per-width normalised mixture ['0']
@@ -75,7 +75,9 @@ data = dict(val_dataloader=dict(samples_per_gpu=_bs), test_dataloader=dict(sampl
 # (standard deviation) -- see mmd2_rbf. Tagged '_bwsp' for spread.
 _bw = os.environ.get('LAKON_MMDG_BW', 'mean')
 # space the MMD is computed in: raw flattened latents, or the rank-8 subspace features
-# (feat_fn, 2048-d) -- the training term's mmd_feature. Tagged '_fsub'.
+# (feat_fn, 2048-d) -- the training term's mmd_feature. Tagged '_fsub'. 'split' scores
+# the subspace AND its complement as two MMDs, each part stepped / renormed against its
+# own norm (MMDGuidance feature='split'). Tagged '_fsplit'.
 _feat = os.environ.get('LAKON_MMDG_FEAT', 'raw')
 # kernel: the RBF mixture, or the energy-distance kernel -||a - b|| (no bandwidth; the
 # width knob does not apply). Tagged '_ken'.
@@ -99,7 +101,7 @@ _tag = (('_ps' if _obj == 'sample' else '')
         + ('' if _share == 'none' else f'_sh{_share}')
         + ('' if _bs == 64 else f'_bs{_bs}')
         + ('' if _bw == 'mean' else '_bwsp')
-        + ('' if _feat == 'raw' else '_fsub')
+        + {'raw': '', 'subspace': '_fsub', 'split': '_fsplit'}[_feat]
         + ('' if _kern == 'rbf' else '_ken')
         + ('' if _bws == _bws_def else '_bw' + '-'.join(f'{v:g}' for v in _bws))
         + ('_kn' if _knorm else '')

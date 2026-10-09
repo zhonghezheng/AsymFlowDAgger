@@ -209,6 +209,14 @@ class EmpiricalExpert(nn.Module):
         sample_chunk (int): rows processed at once in x0_hat (bounds memory).
         bank_chunk (int): bank entries summed at once (bounds peak memory).
         min_sigma (float): floor on ``sigma`` in the posterior denominator.
+        kde_tau2 (float | None): treat every bank entry as a Gaussian BLOB of variance
+            ``kde_tau2`` per kernel-space dimension instead of a point (a kernel
+            density prior). The posterior is then the exact Gaussian-mixture one:
+            weights over N(x_t; (1-s) x0_i, (s^2 + (1-s)^2 tau2) I) and, inside each
+            blob, the Wiener shrinkage ``g (x_t - (1-s) x0_i)`` with
+            ``g = (1-s) tau2 / (s^2 + (1-s)^2 tau2)``. Feat kernel: the blob lives in
+            the rank-8 subspace only, so the shrinkage needs ``project_fn`` in
+            :meth:`x0_hat`. None (default) = point atoms, the code path unchanged.
         bank_storage (str): how a finished bank holds its entries. ``'u8'``
             (default) keeps the uint8 originals on the host and re-derives each
             latent chunk on the GPU inside :meth:`x0_hat` (see :class:`U8Bank`):
@@ -239,6 +247,7 @@ class EmpiricalExpert(nn.Module):
                  temp_spread=None,
                  temp_spread_null_only=False,
                  temp_spread_null=None,
+                 kde_tau2=None,
                  random_flip=True,
                  include_flips=False,
                  num_workers=32,
@@ -332,6 +341,7 @@ class EmpiricalExpert(nn.Module):
         # tools/vstar_cond_probe.py) the null optimum sits at a lower temperature
         # (larger spread) than the conditional one.
         self.temp_spread_null = None if temp_spread_null is None else float(temp_spread_null)
+        self.kde_tau2 = None if kde_tau2 is None else float(kde_tau2)
         self.random_flip = random_flip   # match the training augmentation (h-flip p=0.5)
         self.include_flips = include_flips  # add BOTH h-orientations of every image to the bank
         self.num_workers = num_workers
@@ -637,7 +647,7 @@ class EmpiricalExpert(nn.Module):
 
     @torch.no_grad()
     def x0_hat(self, x_t, sigma, feat_fn, labels, cond_banks, null_banks, null_label,
-               exclude=None):
+               exclude=None, project_fn=None):
         """Posterior-mean data estimate, each row over its OWN trajectory bank:
         row ``i`` uses ``cond_banks[i]`` if ``labels[i] != null_label`` else
         ``null_banks[i]`` (both from :meth:`build_banks`, indexed by position).
@@ -688,12 +698,12 @@ class EmpiricalExpert(nn.Module):
                     for (i, _), sc, d2 in zip(rows, scs, d2s):
                         d2[lo:hi] = (x_t[i].float().unsqueeze(0) - (1 - sc) * full
                                      ).pow(2).flatten(1).sum(-1)
-                d2s = [d2 / (2.0 * sc ** 2) for d2, sc in zip(d2s, scs)]
+                d2s = [d2 / (2.0 * self._lik_var(sc)) for d2, sc in zip(d2s, scs)]
             else:
                 d2s = []
                 for (i, _), sc in zip(rows, scs):
                     resid = x_feat_all[i].unsqueeze(0) - (1 - sc) * feat_m   # [M, Df]
-                    d2s.append(resid.pow(2).sum(-1) / (2.0 * sc ** 2))      # [M]
+                    d2s.append(resid.pow(2).sum(-1) / (2.0 * self._lik_var(sc)))  # [M]
             ws = []
             for (i, is_null), d2 in zip(rows, d2s):
                 ex = None if exclude is None else exclude[i]
@@ -721,7 +731,24 @@ class EmpiricalExpert(nn.Module):
             for (i, _), acc in zip(rows, accs):
                 out[i] = acc
 
+        if self.kde_tau2 is not None:
+            # within-blob posterior mean, linear in x0_i, so applied once to the
+            # mixture mean: x0_hat += g * Pi (x_t - (1 - s) x0_hat), Pi = the kernel
+            # space's projector (identity for 'latent')
+            if self.kernel_space == 'feat':
+                assert project_fn is not None, 'kde_tau2 with the feat kernel needs project_fn'
+            sc = sigma.clamp_min(self.min_sigma).view(B, *([1] * (x_t.dim() - 1)))
+            g = (1 - sc) * self.kde_tau2 / self._lik_var(sc)
+            r = x_t.float() - (1 - sc) * out
+            out = out + g * (project_fn(r) if self.kernel_space == 'feat' else r)
         return out
+
+    def _lik_var(self, sc):
+        """Per-dimension variance of x_t around (1 - s) x0_i: s^2 for point atoms,
+        plus (1 - s)^2 tau2 for Gaussian blobs (kde_tau2)."""
+        if self.kde_tau2 is None:
+            return sc ** 2
+        return sc ** 2 + (1 - sc) ** 2 * self.kde_tau2
 
     def _bank_chunks(self, bank, device):
         """Yield ``(lo, hi, latents)`` over a bank's entries, fp32 on ``device``, in

@@ -48,6 +48,9 @@ Env knobs (defaults in brackets):
                          [/dev/shm/asymflow/train_u8_256 if complete, else
                           data/cached_latents/train_u8_256 if complete]
   LAKON_EV_READ_THREADS  pread threads per rank for the banks  ['32']
+  LAKON_EV_TAU2          Gaussian-blob (KDE) prior variance per kernel dim, tag _kde<tau2>  [off]
+  LAKON_CFG_INTERVAL     '<lo>-<hi>' sigma range where CFG w applies  ['0-0.88']
+                         (a v* window overrides the guided velocity inside it)
   LAKON_EVAL_NUM_IMAGES  FID sample count (wsweep base)   ['10000']
 """
 
@@ -61,7 +64,9 @@ work_dir = f'work_dirs/{name}'
 num_images = int(os.environ.get('LAKON_EVAL_NUM_IMAGES', 10000))  # as the wsweep base
 
 step = 50
-guidance_interval = [0, 0.88]
+guidance_interval = [float(v) for v in os.environ.get('LAKON_CFG_INTERVAL', '0-0.88').split('-')]
+assert len(guidance_interval) == 2 and 0.0 <= guidance_interval[0] < guidance_interval[1] <= 1.0, \
+    guidance_interval
 
 _gvals = [float(g) for g in os.environ.get('LAKON_GUIDANCE', '1,1.8,2.0,2.2,2.4,2.6').split(',')]
 assert all(g >= 1.0 for g in _gvals), (
@@ -74,6 +79,8 @@ assert all(w is None or (len(w) == 2 and 0.0 <= w[0] < w[1] <= 1.0) for w in _wi
 _arms = os.environ.get('LAKON_EV_ARMS', 'T1').split(',')
 assert 'off' not in _arms, "the control is the 'off' WINDOW (LAKON_EV_WINDOWS), not an arm"
 _kern = os.environ.get('LAKON_EV_KERNEL', 'feat')
+_tau2 = os.environ.get('LAKON_EV_TAU2')
+_tau2 = float(_tau2) if _tau2 else None
 
 # della has no node-local disk on ailab; its verified copy of the cache sits on GPFS.
 # The banks are every row's ENTIRE class, so without a cache each eval batch decodes
@@ -90,18 +97,18 @@ def _ev(arm, win):
     if win is None:
         return None
     return dict(sigma_switch=win[0], sigma_hi=win[1], kernel_space=_kern,
-                temp_spread=None if arm == 'T1' else float(arm),
+                temp_spread=None if arm == 'T1' else float(arm), kde_tau2=_tau2,
                 u8_cache=_u8, u8_read_threads=_read_threads)
 
 
 def _prefix(g, arm, win):
     # the control's prefix is exactly the wsweep's
     base = (f'cond_heun_g{g}_step{step}' if g == 1.0 else
-            f'cfg_heun_g{g}({guidance_interval[0]}-{guidance_interval[1]})_step{step}')
+            f'cfg_heun_g{g}({guidance_interval[0]:g}-{guidance_interval[1]:g})_step{step}')
     if win is None:
         return base
     return (f'{base}_ev{"T1" if arm == "T1" else "ts" + arm}({win[0]:g}-{win[1]:g})'
-            + ('' if _kern == 'feat' else '_klat'))
+            + ('' if _kern == 'feat' else '_klat') + ('' if _tau2 is None else f'_kde{_tau2:g}'))
 
 
 # one hook per distinct prefix: the control is the same for every temperature arm

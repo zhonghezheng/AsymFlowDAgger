@@ -162,6 +162,9 @@ def mmd2_rbf(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), unbiased=True, eps=1
     return total / len(bandwidths)
 
 
+_MMD_TAGS = dict(subspace='mmd_sub', raw='mmd_raw', complement='mmd_comp')
+
+
 def mmd2_rbf_sharded(fx, fy, bandwidths=(0.25, 0.5, 1.0, 2.0, 4.0), eps=1e-12):
     """:func:`mmd2_rbf` (``width='mean'``, unbiased) over the POOLED sets of every DDP
     rank, with the kernel matrices ROW-SHARDED across ranks instead of computed whole
@@ -357,7 +360,25 @@ class GaussianFlowMMD(GaussianFlowDagger):
         mmd_feature (str): ``'subspace'`` (the AsymJiT rank-``basis_rank``
             features, ``feat_fn``), ``'raw'`` (flattened latents), or ``'both'``
             (sum). The space(s) NOT trained on are still computed under no_grad
-            and logged, so both are always visible.
+            and logged, so both are always visible. ``'split'``: TWO terms, the
+            subspace features and the COMPLEMENT ``x - project_fn(x)`` (raw-sized,
+            logged as ``mmd_comp``), the training analogue of MMDGuidance's
+            ``feature='split'``; raw is not scored then. How the two combine is
+            ``mmd_split_norm``.
+        mmd_split_norm (bool): ``'split'`` under ``mmd_chunk`` only. False (default):
+            the plain sum MMD^2_sub + MMD^2_comp, its exact gradient. True: the
+            state gradient at each band state is the split GUIDANCE step instead --
+            each part's MMD gradient rescaled to that part's own norm,
+            ``d = g_sub ||x_sub|| / ||g_sub|| + g_comp ||x_comp|| / ||g_comp||``
+            (norms pooled over every rank and row, as the guidance's norm='batch'),
+            divided by ``M * D`` (pooled rollouts x latent dims). That is the
+            gradient of ``1/2 mean_elem ||x - sg(x - d)||^2``, a unit-step regression
+            of the rollout onto its own guided state, so ``mmd_weight`` acts as the
+            guidance step alpha times the regression weight. It is NOT the gradient
+            of a fixed loss: the parts are balanced by their size, not by how large
+            their MMD gradients happen to be (the subspace is ~1% of the dims, and its
+            raw gradient is swamped in a plain sum). The guidance's renorm is
+            dropped: its radial correction is second order (norm ratio ~1 + 1e-5).
         mmd_bandwidths (tuple): RBF bandwidth multipliers on the median heuristic.
         mmd_width (str): what the multipliers scale -- ``'mean'`` (the mean target
             pairwise squared distance, default) or ``'spread'`` (its standard
@@ -434,10 +455,11 @@ class GaussianFlowMMD(GaussianFlowDagger):
                  mmd_grad_probe=False,
                  mmd_target_share='none',
                  mmd_chunk=None,
+                 mmd_split_norm=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        assert mmd_feature in ('subspace', 'raw', 'both')
-        if mmd_feature in ('subspace', 'both'):
+        assert mmd_feature in ('subspace', 'raw', 'both', 'split')
+        if mmd_feature in ('subspace', 'both', 'split'):
             assert hasattr(self.denoising, 'proj_buffer'), \
                 "mmd_feature='subspace' needs an AsymJiT-style denoising with proj_buffer."
         self.mmd_weight = float(mmd_weight)
@@ -588,6 +610,11 @@ class GaussianFlowMMD(GaussianFlowDagger):
             'not fit).')
         self.mmd_grad_probe = mmd_grad_probe
         self.mmd_chunk = None if mmd_chunk is None else int(mmd_chunk)
+        self.mmd_split_norm = bool(mmd_split_norm)
+        assert not self.mmd_split_norm or (
+            mmd_feature == 'split' and self.mmd_chunk is not None), (
+            "mmd_split_norm needs mmd_feature='split' and mmd_chunk: it rescales the "
+            'per-state gradients, which only the chunked path holds explicitly.')
         if self.mmd_chunk is not None:
             assert self.mmd_chunk >= 1
             # mmd_batch exceeds the micro-batch here, so the rollout labels cannot be
@@ -802,22 +829,53 @@ class GaussianFlowMMD(GaussianFlowDagger):
         return torch.from_numpy(
             image_preproc(img, self.denoising.input_size, random_flip=True))
 
+    def _target_shard(self):
+        """``(rank, world_size)`` the target draw is split over: each class's pool is
+        partitioned into ``world_size`` disjoint strides so the POOLED target set
+        cannot repeat an image across ranks. ``(0, 1)`` without pooling."""
+        if self.mmd_gather and dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return 0, 1
+
     def _pick_target_paths(self, labels, per_row):
-        """``per_row`` relpaths per label, drawn uniformly from that label's ENTIRE
-        class pool. Pure CPU/python -- safe to run off the main thread."""
-        rel = []
-        for c in labels:
-            c = int(c)
-            pool = self._target_paths[c] if 0 <= c < len(self._target_paths) \
-                and self._target_paths[c] else None
-            if pool is None:  # null label (or an empty class) -> draw from everything
-                for _ in range(per_row):
-                    cc = random.randrange(len(self._target_paths))
-                    while not self._target_paths[cc]:
-                        cc = random.randrange(len(self._target_paths))
-                    rel.append(random.choice(self._target_paths[cc]))
-            else:
-                rel.extend(random.choice(pool) for _ in range(per_row))
+        """``per_row`` relpaths per label, row-major, drawn uniformly WITHOUT
+        replacement: no image appears twice in one draw, on this rank or (pooled)
+        across ranks. Each class's pool is split into world_size disjoint strides
+        (rank r takes entries r, r + ws, ...), and every row of class c on this rank
+        takes its ``per_row`` images from ONE ``random.sample`` over that stride.
+        Draws are independent across calls (with replacement ACROSS iterations).
+        A null (or empty) label draws class-uniformly from the whole set, still
+        without repeats. Pure CPU/python -- safe to run off the main thread."""
+        rank, ws = self._target_shard()
+        n_cls = len(self._target_paths)
+        valid = [0 <= int(c) < n_cls and bool(self._target_paths[int(c)]) for c in labels]
+        need = {}
+        for c, ok in zip(labels, valid):
+            if ok:
+                need[int(c)] = need.get(int(c), 0) + per_row
+        picks = {}
+        for c, n in need.items():
+            pool = self._target_paths[c][rank::ws]
+            assert n <= len(pool), (
+                f'class {c}: {n} targets without replacement from a {len(pool)}-image '
+                f'shard (class {len(self._target_paths[c])} / {ws} ranks); lower '
+                f'mmd_target_n or raise mmd_classes_per_batch.')
+            picks[c] = iter(random.sample(pool, n))
+        rel, used = [], set()
+        for c, ok in zip(labels, valid):
+            if ok:
+                rel.extend(next(picks[int(c)]) for _ in range(per_row))
+                continue
+            for _ in range(per_row):   # null label: class-uniform, no repeats
+                while True:
+                    cc = random.randrange(n_cls)
+                    shard = self._target_paths[cc][rank::ws]
+                    if shard:
+                        path = random.choice(shard)
+                        if path not in used:
+                            used.add(path)
+                            rel.append(path)
+                            break
         return rel
 
     def _load_target_images(self, labels, per_row):
@@ -828,12 +886,25 @@ class GaussianFlowMMD(GaussianFlowDagger):
             return self._target_u8.get(rel, flip=np.random.rand(len(rel)) < 0.5)
         return torch.stack(list(self._target_pool.map(self._load_one_target, rel)))
 
-    def _draw_restricted_labels(self, m, device):
+    def _draw_restricted_labels(self, m, device, step=None):
         """``m`` trajectory labels spread over ``mmd_classes_per_batch`` DISTINCT
         classes, drawn uniformly without replacement (as d-flow's draw_classes does),
-        so each class carries ~m/C trajectories rather than one."""
+        so each class carries ~m/C trajectories rather than one -- and DISJOINT across
+        ranks, so the pooled rollout set is without replacement too: every rank cuts
+        its own slice of C classes from ONE permutation that all ranks generate
+        identically (a CPU generator seeded from the training ``step``; no
+        communication). Seeding by step also makes the draw reproducible across a
+        resume and identical between runs of the same seed schedule."""
+        rank, ws = self._target_shard()
+        n_cls = int(self.denoising.num_classes)
         c = max(1, min(int(self.mmd_classes_per_batch), m))
-        cls = torch.randperm(int(self.denoising.num_classes), device=device)[:c]
+        assert c * ws <= n_cls, (
+            f'{c} classes x {ws} ranks exceeds {n_cls} classes: cannot draw them '
+            'disjointly.')
+        if step is None:   # no iteration available: a per-instance counter (same on every rank)
+            step = self._class_draw_count = getattr(self, '_class_draw_count', -1) + 1
+        g = torch.Generator().manual_seed(0x6D6D64 * 1000003 + int(step))
+        cls = torch.randperm(n_cls, generator=g)[rank * c:(rank + 1) * c].to(device)
         return cls[torch.arange(m, device=device) % c]
 
     def _prefetch_targets(self, labels, per_row, n_draws):
@@ -946,7 +1017,36 @@ class GaussianFlowMMD(GaussianFlowDagger):
     def _mmd_feats(self, x, space):
         if space == 'subspace':
             return self.feat_fn(x).flatten(1)
+        if space == 'complement':
+            return (x - self.project_fn(x)).flatten(1)
         return x.flatten(1)
+
+    def _mmd_spaces(self):
+        """``(trained, scored)`` feature spaces: every scored space is logged, the
+        ones not trained on are scored under no_grad. 'split' scores only its two
+        parts (raw would be another raw-sized kernel per state for a log line)."""
+        if self.mmd_feature == 'split':
+            return ('subspace', 'complement'), ('subspace', 'complement')
+        train = ('subspace', 'raw') if self.mmd_feature == 'both' else (self.mmd_feature, )
+        return train, ('subspace', 'raw')
+
+    def _split_norm_grad(self, x_k, sur_sub, sur_comp, n_pooled):
+        """``mmd_split_norm``'s state gradient at one band state (see the class
+        docstring): each part's MMD gradient rescaled to the part's own pooled norm,
+        over ``M * D``. ``sur_*`` are :func:`mmd2_rbf_sharded` surrogates of ``x_k``,
+        whose gradients are the pooled MMD^2's for this rank's rows."""
+        g_s = torch.autograd.grad(sur_sub, x_k)[0]
+        g_c = torch.autograd.grad(sur_comp, x_k)[0]
+        with torch.no_grad():
+            x = x_k.detach().float()
+            x_s = self.project_fn(x)
+            sq = torch.stack([x_s.pow(2).sum(), (x - x_s).pow(2).sum(),
+                              g_s.pow(2).sum(), g_c.pow(2).sum()]).double()
+            if self.mmd_gather and dist.is_available() and dist.is_initialized():
+                dist.all_reduce(sq)
+            n_xs, n_xc, n_gs, n_gc = sq.sqrt().float().unbind(0)
+            d = g_s * (n_xs / n_gs.clamp_min(1e-30)) + g_c * (n_xc / n_gc.clamp_min(1e-30))
+            return d / float(n_pooled * x[0].numel())
 
     def _mmd_loss(self, x_0, class_labels, t_split, rows_match=True):
         """Per-NFE-step MMD^2 between the rollout marginal and the noised on-path
@@ -968,9 +1068,8 @@ class GaussianFlowMMD(GaussianFlowDagger):
         the micro-batch rows the rollout trajectories correspond to. Shared by
         GaussianFlowOnPolicy, whose band labels are drawn independently of the batch."""
         m = labels.numel()
-        train_spaces = ('subspace', 'raw') if self.mmd_feature == 'both' \
-            else (self.mmd_feature, )
-        per_space = dict(subspace=[], raw=[])
+        train_spaces, spaces = self._mmd_spaces()
+        per_space = {sp: [] for sp in spaces}
         loss = x_0.new_zeros(())
         world_size, n_pooled = 1, m  # overwritten per step once the gather is known
 
@@ -991,7 +1090,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
             # forward-diffusion marginal at the SAME sigma, class-matched to the
             # rollout's labels; one set per step, scored in every space
             x_tgt = self._target_latents(x_0, sigma, labels, per_row, shared)
-            for space in ('subspace', 'raw'):
+            for space in spaces:
                 if space in train_spaces:
                     # gather AFTER the feature map: for the subspace that is 2048-d
                     # per sample instead of the 196608-d state, and the local rows
@@ -1030,7 +1129,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
         for space, vals in per_space.items():
             if not vals:
                 continue
-            tag = 'mmd_sub' if space == 'subspace' else 'mmd_raw'
+            tag = _MMD_TAGS[space]
             acc = float(self.mmd_accum_steps)  # see `scale` above: read as true MMD^2
             log_vars[tag] = torch.stack(vals).mean() * acc
             if space in train_spaces:  # per-step detail for the trained space only
@@ -1085,8 +1184,7 @@ class GaussianFlowMMD(GaussianFlowDagger):
         acc = float(self.mmd_accum_steps)
         world_size = dist.get_world_size() if (
             self.mmd_gather and dist.is_available() and dist.is_initialized()) else 1
-        train_spaces = ('subspace', 'raw') if self.mmd_feature == 'both' \
-            else (self.mmd_feature, )
+        train_spaces, spaces = self._mmd_spaces()
         if noise is None:
             noise = torch.randn((m, ) + tuple(x_0.shape[1:]), device=dev, dtype=x_0.dtype)
         chunks = [slice(i, min(i + self.mmd_chunk, m)) for i in range(0, m, self.mmd_chunk)]
@@ -1117,15 +1215,15 @@ class GaussianFlowMMD(GaussianFlowDagger):
                 x1_s = self._draw_target_latents([int(c) for c in labels], per_row, dev)
             shared = (x1_s,
                       torch.randn_like(x1_s) if self.mmd_target_share == 'both' else None)
-        per_space = dict(subspace=[], raw=[])
+        per_space = {sp: [] for sp in spaces}
         grads = []
         for k, sigma in enumerate(sigmas):
             x_tgt = self._target_latents(x_0, sigma, labels, per_row, shared)
             x_k = states[k].detach().requires_grad_(True)
             if replay:
                 states[k] = None   # only its gradient is needed from here on
-            surrogate = 0.0
-            for space in ('subspace', 'raw'):
+            surrogate, part_sur = 0.0, dict()
+            for space in spaces:
                 train = space in train_spaces
                 with contextlib.nullcontext() if train else torch.no_grad():
                     val, sur = mmd2_rbf_sharded(
@@ -1134,8 +1232,13 @@ class GaussianFlowMMD(GaussianFlowDagger):
                 per_space[space].append(val)
                 if train:
                     surrogate = surrogate + sur
-            grads.append(torch.autograd.grad(surrogate, x_k)[0])
-            del x_tgt, x_k, surrogate, sur
+                    part_sur[space] = sur
+            if self.mmd_split_norm:
+                grads.append(self._split_norm_grad(
+                    x_k, part_sur['subspace'], part_sur['complement'], m * world_size))
+            else:
+                grads.append(torch.autograd.grad(surrogate, x_k)[0])
+            del x_tgt, x_k, surrogate, sur, part_sur
         del shared
         t2 = clock()
 
@@ -1159,8 +1262,19 @@ class GaussianFlowMMD(GaussianFlowDagger):
         t3 = clock()
 
         log_vars = dict()
+        # the MMD term's OWN parameter gradient, as the optimizer will see it: .grad
+        # holds only this term here (zeroed at the step start; the FM forward runs
+        # after), times acc * world_size -- undone below after DDP's sum.
+        with torch.no_grad():
+            g_flat = torch.cat([p.grad.detach().float().flatten()
+                                for p in self.denoising.parameters() if p.grad is not None])
+            if world_size > 1:
+                dist.all_reduce(g_flat)
+            # optimizer sees sum_r / (world_size * acc); * acc again for the log average
+            log_vars['mmd_pgrad_norm'] = g_flat.norm() / (acc * world_size) * acc
+            del g_flat
         for space, vals in per_space.items():
-            tag = 'mmd_sub' if space == 'subspace' else 'mmd_raw'
+            tag = _MMD_TAGS[space]
             log_vars[tag] = torch.stack(vals).mean() * acc
             if space in train_spaces:   # per-step detail for the trained space only
                 for sigma, v in zip(sigmas, vals):
@@ -1258,7 +1372,9 @@ class GaussianFlowMMD(GaussianFlowDagger):
             if self.mmd_classes_per_batch is not None:
                 # drawn ONCE here and reused below: a second draw would prefetch one
                 # class set and then score a different one
-                mmd_labels = self._draw_restricted_labels(m, x_0.device)
+                mmd_labels = self._draw_restricted_labels(
+                    m, x_0.device,
+                    step=None if running_status is None else running_status.get('iteration'))
                 rows_match = False   # the rows' images are of OTHER classes now
             per_row = self._target_per_row(m, rows_match)
             if per_row is not None:   # target drawn from disk -> prefetch it

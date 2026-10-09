@@ -181,7 +181,13 @@ class MMDGuidance:
             ``feat_fn``: AsymJiT's rank-8 per-patch features, 2048-d, as
             GaussianFlowMMD's ``mmd_feature='subspace'``). The step, its norm and the
             renorm stay on the full state; feat_fn is linear, so the gradient is the
-            subspace-feature gradient mapped back through the projection.
+            subspace-feature gradient mapped back through the projection. ``'split'``
+            -- TWO MMDs, one on the subspace features and one on the complement
+            ``x - project_fn(x)`` (raw-sized), same kernel settings, each with its own
+            gradient. Each part steps by ``scale`` times ITS OWN norm and (``renorm``)
+            is put back on its own pre-step norm, so the 2048-d subspace is not moved
+            ~10x harder, relative to its size, than the 194k-d complement (which a
+            single full-state step norm does). Logs each part's MMD^2 separately.
         normalize (bool): divide each width's term by its target-target mean
             (:func:`mmd2_rbf`), so a mixture of very different widths is balanced.
         width (str): kernel widths from the targets' pairwise squared distances --
@@ -243,8 +249,9 @@ class MMDGuidance:
         self.bandwidths = tuple(bandwidths)
         assert width in ('mean', 'spread'), width
         self.width = width
-        assert feature in ('raw', 'subspace'), feature
+        assert feature in ('raw', 'subspace', 'split'), feature
         self.feature = feature
+        self._spaces = ('subspace', 'complement') if feature == 'split' else (feature, )
         assert width == 'mean' or objective == 'pooled' or int(target_per_row or 16) >= 4, (
             "width='spread' with objective='sample' needs target_per_row >= 4.")
         assert width == 'mean' or unbiased, "width='spread' needs the unbiased estimator."
@@ -303,16 +310,43 @@ class MMDGuidance:
         self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
 
     def _pick(self, labels):
-        """``target_per_row`` relpaths per label from that class's whole pool, row-major
-        (row b's targets are entries ``b*K .. b*K+K-1``); a null (or out-of-range) label
-        draws from the whole dataset, class first."""
-        rel = []
-        for c in labels:
-            for _ in range(self.target_per_row):
-                cc = c
-                while not (0 <= cc < self.num_classes and self._paths[cc]):
+        """``target_per_row`` relpaths per label from that class's pool, row-major
+        (row b's targets are entries ``b*K .. b*K+K-1``), drawn WITHOUT replacement:
+        no image appears twice in one draw, on this rank or (with ``gather``) across
+        ranks -- each class's pool is split into world_size disjoint strides and all
+        of this rank's rows of a class share one ``sample`` over its stride. A null
+        (or out-of-range) label draws from the whole dataset, class first, also
+        without repeats."""
+        rank, ws = (dist.get_rank(), dist.get_world_size()) \
+            if (self.gather and _dist_on()) else (0, 1)
+        K = self.target_per_row
+        ok = [0 <= c < self.num_classes and bool(self._paths[c]) for c in labels]
+        need = {}
+        for c, v in zip(labels, ok):
+            if v:
+                need[c] = need.get(c, 0) + K
+        picks = {}
+        for c, n in need.items():
+            pool = self._paths[c][rank::ws]
+            assert n <= len(pool), (
+                f'class {c}: {n} targets without replacement from a {len(pool)}-image '
+                f'shard (class {len(self._paths[c])} / {ws} ranks).')
+            picks[c] = iter(self._rng.sample(pool, n))
+        rel, used = [], set()
+        for c, v in zip(labels, ok):
+            if v:
+                rel.extend(next(picks[c]) for _ in range(K))
+                continue
+            for _ in range(K):
+                while True:
                     cc = self._rng.randrange(self.num_classes)
-                rel.append(self._rng.choice(self._paths[cc]))
+                    shard = self._paths[cc][rank::ws]
+                    if shard:
+                        path = self._rng.choice(shard)
+                        if path not in used:
+                            used.add(path)
+                            rel.append(path)
+                            break
         return rel
 
     def _load_one(self, rel_path):
@@ -359,6 +393,10 @@ class MMDGuidance:
         self._encode_fn = encode_fn
         self._shared = None
         self._stats = dict(before=[], after=[], sigma=[], norm=[])
+        if self.feature == 'split':
+            for k in ('before', 'after'):
+                for sp in self._spaces:
+                    self._stats[f'{k}_{sp}'] = []
         n = 1 if self.target_share != 'none' else self.lookahead
         for _ in range(n):
             self._submit()
@@ -379,6 +417,11 @@ class MMDGuidance:
             return out
         out['mmdg_mmd'] = float(np.mean(st['before']))
         out['mmdg_mmd_after'] = float(np.mean(st['after']))
+        if self.feature == 'split':   # 'before' / 'after' are the parts' SUM
+            for sp in self._spaces:
+                tag = 'sub' if sp == 'subspace' else 'comp'
+                out[f'mmdg_mmd_{tag}'] = float(np.mean(st[f'before_{sp}']))
+                out[f'mmdg_mmd_after_{tag}'] = float(np.mean(st[f'after_{sp}']))
         out['mmdg_norm_ratio'] = float(np.mean(st['norm']))
         # cumulative drift renorm prevented (or, with renorm off, the drift applied)
         out['mmdg_norm_ratio_prod'] = float(np.prod(st['norm']))
@@ -412,19 +455,24 @@ class MMDGuidance:
             dist.all_reduce(v)
         return v
 
-    def _feat(self, diffusion, z):
-        """``[M, C, H, W]`` states -> ``[M, F]`` MMD features (see ``feature``)."""
-        if self.feature == 'subspace':
+    def _feat(self, diffusion, z, space=None):
+        """``[M, C, H, W]`` states -> ``[M, F]`` MMD features in ``space`` (default: the
+        single space of ``feature``; 'split' scores 'subspace' and 'complement')."""
+        space = space or self._spaces[0]
+        if space in ('subspace', 'complement'):
             assert hasattr(diffusion, 'feat_fn'), (
-                "feature='subspace' needs a diffusion with feat_fn (GaussianFlowDagger).")
-            return diffusion.feat_fn(z).flatten(1)
+                f"feature='{self.feature}' needs a diffusion with feat_fn / project_fn "
+                '(GaussianFlowDagger).')
+            if space == 'subspace':
+                return diffusion.feat_fn(z).flatten(1)
+            return (z - diffusion.project_fn(z)).flatten(1)
         return z.flatten(1)
 
-    def _score(self, diffusion, x, y):
+    def _score(self, diffusion, x, y, space=None):
         """The objective's MMD^2 for the rollout state ``x [B, ...]`` against the noised
         target FEATURES ``y`` (``[B, K, F]`` for 'sample', pooled ``[N, F]`` for
-        'pooled'). Returns ``(value to differentiate, value to log)``."""
-        fx = self._feat(diffusion, x)
+        'pooled'), in ``space``. Returns ``(value to differentiate, value to log)``."""
+        fx = self._feat(diffusion, x, space)
         if self.objective == 'sample':
             per_row = mmd2_point_energy(fx, y, beta=self.energy_beta) if self.kernel == 'energy' else \
                 mmd2_point_rbf(fx, y, bandwidths=self.bandwidths, width=self.width,
@@ -456,11 +504,21 @@ class MMDGuidance:
                 x0, eps = self._shared
             if eps is None:
                 eps = torch.randn_like(x0)
-            y = self._feat(diffusion, (x0 * (1.0 - sigma) + eps * sigma).float()).float()
-            if self.objective == 'sample':
-                y = y.view(x_t.shape[0], self.target_per_row, -1)   # row b's own targets
-            else:
-                y = self._gather(y)
+            x_tgt = (x0 * (1.0 - sigma) + eps * sigma).float()
+            del x0, eps
+            ys = dict()
+            for sp in self._spaces:
+                y = self._feat(diffusion, x_tgt, sp).float()
+                if self.objective == 'sample':
+                    y = y.view(x_t.shape[0], self.target_per_row, -1)   # row b's own targets
+                else:
+                    y = self._gather(y)
+                ys[sp] = y
+            del x_tgt, y
+
+        if self.feature == 'split':
+            return self._split_step(diffusion, x_t, ys, sigma)
+        y = ys[self._spaces[0]]
 
         if self.measure_only:
             with torch.no_grad(), _no_tf32():
@@ -500,3 +558,63 @@ class MMDGuidance:
         self._stats['after'].append(after)
         self._stats['norm'].append(drift)
         return x_new.to(x_t.dtype)
+
+    def _norms(self, *ts):
+        """L2 norms of each tensor: pooled scalars over every rank (``norm='batch'``),
+        or per row ``[B, 1, ..]`` (``'sample'``)."""
+        if self.norm == 'batch':
+            sq = self._all_sum(torch.stack([t.pow(2).sum() for t in ts]))
+            return list(sq.sqrt().unbind(0))
+        dims = tuple(range(1, ts[0].dim()))
+        return [t.pow(2).sum(dims, keepdim=True).sqrt() for t in ts]
+
+    def _split_step(self, diffusion, x_t, ys, sigma):
+        """``feature='split'``: one MMD per part, each part's step and renorm against
+        its own norm (see the class docstring). The subspace gradient lies in the
+        subspace and the complement's in the complement (both feature maps are
+        linear projections), so each moves only its own part."""
+        spaces = self._spaces
+        before, grads = dict(), dict()
+        with torch.enable_grad(), _no_tf32():
+            for sp in spaces:
+                x = x_t.detach().float().requires_grad_(True)
+                val, before[sp] = self._score(diffusion, x, ys[sp], sp)
+                if not self.measure_only:
+                    grads[sp], = torch.autograd.grad(val, x)
+                del val, x
+
+        with torch.no_grad(), _no_tf32():
+            x = x_t.detach().float()
+            if self.measure_only:
+                x_new, drift, after = x, 1.0, before
+            else:
+                xs = diffusion.project_fn(x)
+                parts = dict(subspace=xs, complement=x - xs)
+                del xs
+                n_x = dict(zip(spaces, self._norms(*[parts[sp] for sp in spaces])))
+                n_g = dict(zip(spaces, self._norms(*[grads[sp] for sp in spaces])))
+                x_new = x.clone()
+                for sp in spaces:
+                    x_new.sub_(grads[sp] * (self.scale * n_x[sp] / n_g[sp].clamp_min(1e-30)))
+                del grads
+                n_old, n_new = self._norms(x, x_new)
+                ratio = n_new / n_old.clamp_min(1e-30)   # ||x'|| / ||x||, before renorm
+                if self.renorm:
+                    s_new = diffusion.project_fn(x_new)
+                    c_new = x_new - s_new
+                    n_s, n_c = self._norms(s_new, c_new)
+                    x_new = s_new * (n_x['subspace'] / n_s.clamp_min(1e-30)) \
+                        + c_new * (n_x['complement'] / n_c.clamp_min(1e-30))
+                    del s_new, c_new
+                del parts
+                drift = float(ratio.mean())
+                after = {sp: self._score(diffusion, x_new, ys[sp], sp)[1] for sp in spaces}
+        st = self._stats
+        st['sigma'].append(sigma)
+        st['before'].append(sum(before.values()))
+        st['after'].append(sum(after.values()))
+        st['norm'].append(drift)
+        for sp in spaces:
+            st[f'before_{sp}'].append(before[sp])
+            st[f'after_{sp}'].append(after[sp])
+        return x_t if self.measure_only else x_new.to(x_t.dtype)

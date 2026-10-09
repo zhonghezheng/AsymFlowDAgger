@@ -100,12 +100,21 @@ _tscope = os.environ.get('LAKON_TEMP_SCOPE', 'both')
 _tsn = os.environ.get('LAKON_TEMP_SPREAD_NULL')
 assert not (_tsn and _tscope == 'null'), 'LAKON_TEMP_SPREAD_NULL replaces LAKON_TEMP_SCOPE=null'
 
+# LAKON_KDE_TAU2: Gaussian-blob (KDE) atoms in the expert -- each bank entry is a blob
+# of variance tau2 per kernel dim instead of a point, the exact Gaussian-mixture
+# posterior (EmpiricalExpert kde_tau2), on BOTH banks. 10 = the held-out v*_cond MSE
+# optimum over the band (kde_probe, 2026-10-07). Composes with the temperature knobs
+# (they rescale the d2 the blobs already widen); leave those unset for pure KDE.
+# Tagged '_kde<tau2>'.
+_kde = os.environ.get('LAKON_KDE_TAU2')
+
 _ncls = os.environ.get('LAKON_BAND_NCLS')
 _nb = os.environ.get('LAKON_BAND_NULLBATCH', '0')
 _clstag = ((f'_c{_ncls}' if _ncls else '') + ('nb' if _nb != '0' else '')
            + ('' if _nt == '1' else f'_T{_nt}')
            + (f'_tsc{_ts or "T1"}n{_tsn}' if _tsn else
-              '' if not _ts else f'_ts{_ts}{"u" if _tscope == "null" else "b"}'))
+              '' if not _ts else f'_ts{_ts}{"u" if _tscope == "null" else "b"}')
+           + ('' if not _kde else f'_kde{float(_kde):g}'))
 # band interval: tagged only when off the default 8, so existing run names (and their
 # resume checkpoints) are unchanged while other intervals get their own work_dir.
 # band interval. DEFAULT 1: the band fires every iteration. Interval 8 applied the
@@ -244,7 +253,8 @@ model = dict(
                 u8_cache=_u8,
                 temp_spread=(float(_ts) if _ts else None),
                 temp_spread_null_only=(_tscope == 'null'),
-                temp_spread_null=(float(_tsn) if _tsn else None)),
+                temp_spread_null=(float(_tsn) if _tsn else None),
+                kde_tau2=(float(_kde) if _kde else None)),
     diffusion=dict(
     type='GaussianFlowOnPolicy',
     # --- the online CFG term ---
